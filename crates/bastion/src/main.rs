@@ -158,7 +158,7 @@ const AGENT_INTEGRATIONS: [(&str, &str); 3] = [
 ];
 // Bump only when Bastion's managed hook definitions change. Application
 // updates alone should not rewrite user configuration or rotate its backup.
-const INTEGRATION_REVISION: &str = "1";
+const INTEGRATION_REVISION: &str = "2";
 
 fn main() -> Result<()> {
     let args = Args::parse();

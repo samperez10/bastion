@@ -81,6 +81,20 @@ enum Command {
         #[arg(long, default_value = "primary")]
         slot: String,
     },
+    /// Read Antigravity's ask_permission tool hook and report attention.
+    ReportAntigravityAttention {
+        #[arg(long, default_value_os_t = default_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "primary")]
+        slot: String,
+    },
+    /// Read Antigravity's Stop hook and report completion when fully idle.
+    ReportAntigravityStop {
+        #[arg(long, default_value_os_t = default_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "primary")]
+        slot: String,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -168,7 +182,15 @@ fn main() -> Result<()> {
             state,
             reason,
         } => report_agent_state(state_dir, "codex", &slot, state, reason.as_deref()),
-        Command::ReportAntigravity { state_dir, slot } => report_antigravity(state_dir, &slot),
+        Command::ReportAntigravity { state_dir, slot } => {
+            report_antigravity(state_dir, &slot, AntigravityHook::PreInvocation)
+        }
+        Command::ReportAntigravityAttention { state_dir, slot } => {
+            report_antigravity(state_dir, &slot, AntigravityHook::Attention)
+        }
+        Command::ReportAntigravityStop { state_dir, slot } => {
+            report_antigravity(state_dir, &slot, AntigravityHook::Stop)
+        }
     }
 }
 
@@ -517,21 +539,64 @@ fn install_antigravity(config_dir: PathBuf, state_dir: PathBuf, slot: &str) -> R
         .context("Antigravity hooks.json must be a JSON object")?;
     let executable = std::env::current_exe().context("locate workspace-agent executable")?;
     let slot_default = shell_slot_default(slot)?;
-    let command = managed_hook_command(format!(
-        "{} report-antigravity --state-dir {} --slot \"${{WORKSPACE_AGENT_SLOT:-{}}}\"",
-        shell_quote(&executable.to_string_lossy()),
-        shell_quote(&state_dir.to_string_lossy()),
-        slot_default
-    ));
+    let working_command = managed_antigravity_hook_command(
+        format!(
+            "{} report-antigravity --state-dir {} --slot \"${{WORKSPACE_AGENT_SLOT:-{}}}\"",
+            shell_quote(&executable.to_string_lossy()),
+            shell_quote(&state_dir.to_string_lossy()),
+            slot_default
+        ),
+        "{}",
+    );
+    let attention_command = managed_antigravity_hook_command(
+        format!(
+            "{} report-antigravity-attention --state-dir {} --slot \"${{WORKSPACE_AGENT_SLOT:-{}}}\"",
+            shell_quote(&executable.to_string_lossy()),
+            shell_quote(&state_dir.to_string_lossy()),
+            slot_default
+        ),
+        r#"{"decision":"allow"}"#,
+    );
+    let stop_command = managed_antigravity_hook_command(
+        format!(
+            "{} report-antigravity-stop --state-dir {} --slot \"${{WORKSPACE_AGENT_SLOT:-{}}}\"",
+            shell_quote(&executable.to_string_lossy()),
+            shell_quote(&state_dir.to_string_lossy()),
+            slot_default
+        ),
+        r#"{"decision":"allow"}"#,
+    );
     object.insert(
         "bastion".to_owned(),
-        json!({"PreInvocation": [{"type":"command", "command": command, "timeout": 10}]}),
+        json!({
+            "PreInvocation": [{
+                "type": "command",
+                "command": working_command,
+                "timeout": 3
+            }],
+            "PreToolUse": [{
+                "matcher": "ask_permission",
+                "hooks": [{
+                    "type": "command",
+                    "command": attention_command,
+                    "timeout": 3
+                }]
+            }],
+            "Stop": [{
+                "type": "command",
+                "command": stop_command,
+                "timeout": 3
+            }]
+        }),
     );
     if path.exists() {
         fs::copy(&path, path.with_file_name("hooks.json.bastion-backup"))?;
     }
     fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
-    println!("Enabled Antigravity session restore in {}", path.display());
+    println!(
+        "Enabled Antigravity session restore and lifecycle integration in {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -611,13 +676,18 @@ fn uninstall_antigravity(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn report_antigravity(state_dir: PathBuf, slot: &str) -> Result<()> {
+#[derive(Clone, Copy)]
+enum AntigravityHook {
+    PreInvocation,
+    Attention,
+    Stop,
+}
+
+fn report_antigravity(state_dir: PathBuf, slot: &str, hook: AntigravityHook) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let Ok(payload) = serde_json::from_str::<Value>(&input) else {
-        return Ok(());
-    };
-    let Some(session_id) = payload.get("conversationId").and_then(Value::as_str) else {
+        print_antigravity_response(hook);
         return Ok(());
     };
     let cwd = payload
@@ -627,7 +697,55 @@ fn report_antigravity(state_dir: PathBuf, slot: &str) -> Result<()> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    report_session(state_dir, "antigravity", slot, session_id, cwd)
+    if let Some(session_id) = payload.get("conversationId").and_then(Value::as_str) {
+        let _ = report_session(state_dir.clone(), "antigravity", slot, session_id, cwd);
+    }
+    match hook {
+        AntigravityHook::PreInvocation => {
+            let _ = report_agent_state(
+                state_dir,
+                "antigravity",
+                slot,
+                LifecycleState::Working,
+                None,
+            );
+        }
+        AntigravityHook::Attention => {
+            let _ = report_agent_state(
+                state_dir,
+                "antigravity",
+                slot,
+                LifecycleState::Attention,
+                Some("permission"),
+            );
+        }
+        AntigravityHook::Stop => {
+            let state = if payload
+                .get("fullyIdle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                LifecycleState::Done
+            } else {
+                LifecycleState::Working
+            };
+            let _ = report_agent_state(state_dir, "antigravity", slot, state, None);
+        }
+    }
+    print_antigravity_response(hook);
+    Ok(())
+}
+
+fn print_antigravity_response(hook: AntigravityHook) {
+    match hook {
+        AntigravityHook::PreInvocation => println!("{{}}"),
+        // `allow` lets ask_permission display its own prompt; it does not grant
+        // the resource permission being requested. Any non-continue decision
+        // lets a Stop event finish normally.
+        AntigravityHook::Attention | AntigravityHook::Stop => {
+            println!(r#"{{"decision":"allow"}}"#);
+        }
+    }
 }
 
 fn report_session(
@@ -771,6 +889,15 @@ fn managed_hook_command(command: String) -> String {
     format!("if [ \"${{BASTION_MANAGED_PANE:-}}\" = 1 ]; then {command}; fi")
 }
 
+/// Antigravity validates hook stdout even when the global hook is invoked by
+/// an ordinary, non-Bastion session. Return a neutral response in that case.
+fn managed_antigravity_hook_command(command: String, neutral_response: &str) -> String {
+    format!(
+        "if [ \"${{BASTION_MANAGED_PANE:-}}\" = 1 ]; then {command}; else printf '%s\\n' {}; fi",
+        shell_quote(neutral_response)
+    )
+}
+
 fn shell_slot_default(slot: &str) -> Result<&str> {
     if !slot.is_empty()
         && slot
@@ -853,6 +980,49 @@ mod tests {
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(value.get("bastion").is_none());
         assert_eq!(value["custom"]["PreInvocation"][0]["command"], "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_install_adds_supported_lifecycle_hooks() {
+        let root = test_dir("antigravity-install");
+        let config = root.join("config");
+        let state = root.join("state");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("hooks.json"),
+            serde_json::to_string_pretty(&json!({
+                "custom": {"PostInvocation": [{"command": "keep"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_antigravity(config.clone(), state, "primary").unwrap();
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(config.join("hooks.json")).unwrap()).unwrap();
+        let bastion = &value["bastion"];
+        assert_eq!(bastion["PreToolUse"][0]["matcher"], "ask_permission");
+        assert!(
+            bastion["PreInvocation"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("report-antigravity")
+        );
+        assert!(
+            bastion["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("report-antigravity-attention")
+        );
+        assert!(
+            bastion["Stop"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("report-antigravity-stop")
+        );
+        assert_eq!(value["custom"]["PostInvocation"][0]["command"], "keep");
+        assert!(config.join("hooks.json.bastion-backup").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }
