@@ -32,8 +32,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-arm64
-      - uses: android-actions/setup-android@v3
-      - run: sdkmanager "ndk;27.2.12479018"
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "ndk;27.2.12479018"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
