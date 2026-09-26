@@ -19,11 +19,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear as WidgetClear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use semver::Version;
+use serde::Deserialize;
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
+    process::Command as ProcessCommand,
     sync::mpsc,
     sync::{
         Arc,
@@ -537,20 +540,29 @@ fn session_dashboard(state_dir: &PathBuf) -> Result<()> {
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let notification_listener = NotificationListener::start(state_dir.clone());
+    let mut install_update = false;
     let result = (|| -> Result<()> {
-        while let Some(workspace) = pick_workspace(&mut terminal, state_dir)? {
-            dashboard_request(
-                state_dir,
-                Request::FocusWorkspace {
-                    cwd: workspace.clone(),
-                },
-            )?;
-            dashboard_in_session(
-                &mut terminal,
-                state_dir,
-                Some(&workspace),
-                &notification_listener,
-            )?;
+        while let Some(choice) = pick_workspace(&mut terminal, state_dir)? {
+            match choice {
+                SessionChoice::Workspace(workspace) => {
+                    dashboard_request(
+                        state_dir,
+                        Request::FocusWorkspace {
+                            cwd: workspace.clone(),
+                        },
+                    )?;
+                    dashboard_in_session(
+                        &mut terminal,
+                        state_dir,
+                        Some(&workspace),
+                        &notification_listener,
+                    )?;
+                }
+                SessionChoice::InstallUpdate => {
+                    install_update = true;
+                    break;
+                }
+            }
         }
         Ok(())
     })();
@@ -563,13 +575,34 @@ fn session_dashboard(state_dir: &PathBuf) -> Result<()> {
         DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
-    result
+    result?;
+    if install_update {
+        let status = ProcessCommand::new(sibling_binary("bastion"))
+            .args([
+                "--state-dir",
+                state_dir.to_string_lossy().as_ref(),
+                "update",
+                "install",
+                "--yes",
+            ])
+            .status()
+            .context("install Bastion update")?;
+        if !status.success() {
+            anyhow::bail!("Bastion update exited with {status}");
+        }
+    }
+    Ok(())
+}
+
+enum SessionChoice {
+    Workspace(PathBuf),
+    InstallUpdate,
 }
 
 fn pick_workspace(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state_dir: &PathBuf,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<SessionChoice>> {
     let response = dashboard_request(state_dir, Request::ListWorkspaces)?;
     let mut workspaces = response
         .get("workspaces")
@@ -580,12 +613,23 @@ fn pick_workspace(
         return Ok(None);
     }
     let mut selected = 0_usize;
-    let mut hint = " S SETTINGS     D REMOVE     Q QUIT ".to_owned();
+    let mut available_update = cached_update_version(state_dir);
+    let mut hint = workspace_hint(available_update.as_deref());
     let mut removing = false;
     let mut settings_open = false;
+    let mut update_confirmation = false;
     let mut selected_setting = 0_usize;
     let mut sound_enabled = Preferences::load(state_dir)?.notifications.sound;
     let result = loop {
+        let refreshed_update = cached_update_version(state_dir);
+        if refreshed_update != available_update
+            && !settings_open
+            && !removing
+            && !update_confirmation
+        {
+            hint = workspace_hint(refreshed_update.as_deref());
+        }
+        available_update = refreshed_update;
         terminal.draw(|frame| {
             let areas = Layout::default()
                 .direction(Direction::Vertical)
@@ -672,7 +716,7 @@ fn pick_workspace(
                 );
             }
             if settings_open {
-                let dialog = centered_fixed(46, 7, frame.area());
+                let dialog = centered_fixed(50, 8, frame.area());
                 let selected_style = Style::default()
                     .fg(accent())
                     .bg(focus_background())
@@ -688,11 +732,20 @@ fn pick_workspace(
                     if selected_setting == 1 { "›" } else { " " },
                     active_theme().name.to_ascii_uppercase()
                 );
+                let updates = format!(
+                    "{} Updates                 {}",
+                    if selected_setting == 2 { "›" } else { " " },
+                    available_update
+                        .as_deref()
+                        .map(|version| format!("v{version}"))
+                        .unwrap_or_else(|| "CURRENT".to_owned())
+                );
                 frame.render_widget(WidgetClear, dialog);
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::styled(sound, if selected_setting == 0 { selected_style } else { normal_style }),
                         Line::styled(theme, if selected_setting == 1 { selected_style } else { normal_style }),
+                        Line::styled(updates, if selected_setting == 2 { selected_style } else { normal_style }),
                         Line::raw(""),
                         Line::styled("  Esc · back", Style::default().fg(muted())),
                     ])
@@ -705,18 +758,51 @@ fn pick_workspace(
                     dialog,
                 );
             }
+            if update_confirmation {
+                let dialog = centered_fixed(54, 10, frame.area());
+                let version = available_update.as_deref().unwrap_or("new release");
+                frame.render_widget(WidgetClear, dialog);
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "Install Bastion v{version}?\n\nThe release will be checksum-verified. A running daemon will restart; saved agent sessions remain available.\n\n  LATER          X SKIP          ENTER UPDATE"
+                    ))
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(accent()))
+                            .title(" BASTION UPDATE "),
+                    ),
+                    dialog,
+                );
+            }
         })?;
         match read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc if update_confirmation => update_confirmation = false,
+                KeyCode::Char('x') if update_confirmation => {
+                    match skip_cached_update(state_dir) {
+                        Ok(()) => hint = " Update skipped until a newer release ".to_owned(),
+                        Err(error) => hint = format!(" Could not skip update: {error:#} "),
+                    }
+                    update_confirmation = false;
+                    settings_open = false;
+                }
+                KeyCode::Enter if update_confirmation => {
+                    break Ok(Some(SessionChoice::InstallUpdate));
+                }
+                _ if update_confirmation => {}
                 KeyCode::Esc if settings_open => settings_open = false,
                 KeyCode::Char('q') if settings_open => settings_open = false,
                 KeyCode::Up | KeyCode::Char('k') if settings_open => {
                     selected_setting = selected_setting.saturating_sub(1)
                 }
                 KeyCode::Down | KeyCode::Char('j') if settings_open => {
-                    selected_setting = (selected_setting + 1).min(1)
+                    selected_setting = (selected_setting + 1).min(2)
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') if settings_open => {
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ')
+                    if settings_open && !update_confirmation =>
+                {
                     if selected_setting == 0 {
                         sound_enabled = !sound_enabled;
                         match set_sound_preference(state_dir, sound_enabled) {
@@ -728,11 +814,15 @@ fn pick_workspace(
                             }
                             Err(error) => hint = format!(" Sound setting failed: {error:#} "),
                         }
-                    } else {
+                    } else if selected_setting == 1 {
                         hint = match cycle_theme(state_dir) {
                             Ok(name) => format!(" Theme: {name} "),
                             Err(error) => format!(" Theme failed: {error:#} "),
                         };
+                    } else if available_update.is_some() {
+                        update_confirmation = true;
+                    } else {
+                        hint = " Bastion is up to date ".to_owned();
                     }
                 }
                 KeyCode::Esc if removing => removing = false,
@@ -781,7 +871,7 @@ fn pick_workspace(
                         .get("canonical_root")
                         .and_then(serde_json::Value::as_str)
                         .context("workspace has no path")?;
-                    break Ok(Some(PathBuf::from(root)));
+                    break Ok(Some(SessionChoice::Workspace(PathBuf::from(root))));
                 }
                 _ => {}
             },
@@ -818,10 +908,37 @@ fn pick_workspace(
             }
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && update_confirmation =>
+            {
+                let size = terminal.size()?;
+                let dialog = centered_fixed(54, 10, Rect::new(0, 0, size.width, size.height));
+                if !contains(dialog, mouse.column, mouse.row) {
+                    update_confirmation = false;
+                } else if mouse.row >= dialog.y.saturating_add(dialog.height.saturating_sub(3)) {
+                    let relative = mouse.column.saturating_sub(dialog.x);
+                    let region = u32::from(relative) * 3 / u32::from(dialog.width.max(1));
+                    match region {
+                        0 => update_confirmation = false,
+                        1 => {
+                            match skip_cached_update(state_dir) {
+                                Ok(()) => {
+                                    hint = " Update skipped until a newer release ".to_owned()
+                                }
+                                Err(error) => hint = format!(" Could not skip update: {error:#} "),
+                            }
+                            update_confirmation = false;
+                            settings_open = false;
+                        }
+                        _ => break Ok(Some(SessionChoice::InstallUpdate)),
+                    }
+                }
+            }
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && settings_open =>
             {
                 let size = terminal.size()?;
-                let dialog = centered_fixed(46, 7, Rect::new(0, 0, size.width, size.height));
+                let dialog = centered_fixed(50, 8, Rect::new(0, 0, size.width, size.height));
                 if !contains(dialog, mouse.column, mouse.row) {
                     settings_open = false;
                 } else if mouse.row == dialog.y.saturating_add(1) {
@@ -835,7 +952,14 @@ fn pick_workspace(
                     if let Err(error) = cycle_theme(state_dir) {
                         hint = format!(" Theme failed: {error:#} ");
                     }
-                } else if mouse.row >= dialog.y.saturating_add(4) {
+                } else if mouse.row == dialog.y.saturating_add(3) {
+                    selected_setting = 2;
+                    if available_update.is_some() {
+                        update_confirmation = true;
+                    } else {
+                        hint = " Bastion is up to date ".to_owned();
+                    }
+                } else if mouse.row >= dialog.y.saturating_add(5) {
                     settings_open = false;
                 }
             }
@@ -866,13 +990,73 @@ fn pick_workspace(
                         .get("canonical_root")
                         .and_then(serde_json::Value::as_str)
                         .context("workspace has no path")?;
-                    break Ok(Some(PathBuf::from(root)));
+                    break Ok(Some(SessionChoice::Workspace(PathBuf::from(root))));
                 }
             }
             _ => {}
         }
     };
     result
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CachedUpdate {
+    release: Option<CachedRelease>,
+    skipped_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CachedRelease {
+    version: String,
+}
+
+fn cached_update_version(state_dir: &std::path::Path) -> Option<String> {
+    let cache: CachedUpdate =
+        serde_json::from_str(&std::fs::read_to_string(state_dir.join("update.json")).ok()?).ok()?;
+    let release = cache.release?;
+    if cache.skipped_version.as_deref() == Some(release.version.as_str()) {
+        return None;
+    }
+    let current = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    let latest = Version::parse(&release.version).ok()?;
+    (latest > current).then_some(release.version)
+}
+
+fn skip_cached_update(state_dir: &std::path::Path) -> Result<()> {
+    let path = state_dir.join("update.json");
+    let mut cache: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).context("read update cache")?)?;
+    let version = cache
+        .get("release")
+        .and_then(|release| release.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .context("no cached update is available")?
+        .to_owned();
+    cache["skipped_version"] = serde_json::Value::String(version);
+    let temporary = state_dir.join("update.json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&cache)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn workspace_hint(update: Option<&str>) -> String {
+    update.map_or_else(
+        || " S SETTINGS     D REMOVE     Q QUIT ".to_owned(),
+        |version| format!(" UPDATE v{version} AVAILABLE · S SETTINGS "),
+    )
+}
+
+fn sibling_binary(name: &str) -> PathBuf {
+    if let Ok(current) = std::env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let candidate = parent.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
 }
 
 fn set_sound_preference(state_dir: &std::path::Path, enabled: bool) -> Result<()> {

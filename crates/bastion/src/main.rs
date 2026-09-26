@@ -14,6 +14,8 @@ use std::{
 use workspace_core::{Preferences, StateDb};
 use workspace_protocol::DAEMON_REVISION;
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -39,6 +41,11 @@ enum Command {
         #[command(subcommand)]
         command: NotificationsCommand,
     },
+    /// Check for and install verified Bastion releases.
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
     /// Build release binaries and install Bastion into Termux's $PREFIX/bin.
     Install {
         /// Installation prefix. Defaults to the Termux PREFIX environment variable.
@@ -55,6 +62,27 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// Check GitHub for a newer Bastion release.
+    Check {
+        /// Ignore the 24-hour release-check cache.
+        #[arg(long)]
+        force: bool,
+        /// Do not print status; intended for background refreshes.
+        #[arg(long, hide = true)]
+        quiet: bool,
+    },
+    /// Download, verify, and install the newest release.
+    Install {
+        /// Install without an interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Ignore the currently available version until a newer one is released.
+    Skip,
 }
 
 #[derive(Subcommand)]
@@ -101,6 +129,7 @@ fn main() -> Result<()> {
         Some(Command::Doctor) => doctor(&args.state_dir),
         Some(Command::Theme { name }) => theme(&args.state_dir, name),
         Some(Command::Notifications { command }) => notifications(&args.state_dir, command),
+        Some(Command::Update { command }) => update::command(&args.state_dir, command),
         Some(Command::Install { prefix }) => install(prefix),
         Some(Command::Workspace { command }) => workspace(&args.state_dir, command),
         Some(Command::Daemon { command }) => daemon_command(&args.state_dir, command),
@@ -298,6 +327,7 @@ fn open(state_dir: &PathBuf, path: Option<PathBuf>) -> Result<()> {
     let project = database.ensure_project(&workspace)?;
     database.focus_project(&project)?;
     ensure_daemon(state_dir, &workspace)?;
+    update::refresh_in_background(state_dir);
     let mut dashboard = ProcessCommand::new(sibling_binary("termux-tui"));
     dashboard.args(["--state-dir", state_dir.to_string_lossy().as_ref()]);
     if open_last_session {

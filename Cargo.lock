@@ -118,11 +118,13 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bastion"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "semver",
+ "serde",
  "serde_json",
  "workspace-core",
  "workspace-protocol",
@@ -130,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-audio"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1148,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-lab"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1159,13 +1161,14 @@ dependencies = [
 
 [[package]]
 name = "termux-tui"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "bastion-audio",
  "clap",
  "crossterm 0.29.0",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "workspace-core",
@@ -1438,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-agent"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1447,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -1458,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-daemon"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1473,14 +1476,14 @@ dependencies = [
 
 [[package]]
 name = "workspace-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "workspace-terminal"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "serde",
