@@ -85,6 +85,7 @@ The same controls are available from the command line:
 
 ```sh
 bastion update check
+bastion update status
 bastion update install
 bastion update skip
 ```

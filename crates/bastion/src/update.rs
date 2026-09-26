@@ -54,11 +54,17 @@ struct GithubAsset {
 
 pub(crate) fn command(state_dir: &Path, command: UpdateCommand) -> Result<()> {
     match command {
-        UpdateCommand::Check { force, quiet } => {
-            let cache = check(state_dir, force)?;
+        UpdateCommand::Check { force: _, quiet } => {
+            // Explicit checks are always fresh. The 24-hour limit is enforced
+            // before refresh_in_background spawns this command.
+            let cache = check(state_dir, true)?;
             if !quiet {
                 print_status(&cache);
             }
+            Ok(())
+        }
+        UpdateCommand::Status => {
+            print_status(&load_cache(state_dir).unwrap_or_default());
             Ok(())
         }
         UpdateCommand::Install { yes } => install(state_dir, yes),
@@ -502,9 +508,9 @@ mod tests {
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.5"));
+        assert!(is_newer("0.1.0-alpha.6"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.4"));
+        assert!(!is_newer("0.1.0-alpha.5"));
         assert!(!is_newer("not-a-version"));
     }
 

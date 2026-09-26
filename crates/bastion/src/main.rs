@@ -68,13 +68,15 @@ enum Command {
 enum UpdateCommand {
     /// Check GitHub for a newer Bastion release.
     Check {
-        /// Ignore the 24-hour release-check cache.
-        #[arg(long)]
+        /// Retained for compatibility; manual checks are always fresh.
+        #[arg(long, hide = true)]
         force: bool,
         /// Do not print status; intended for background refreshes.
         #[arg(long, hide = true)]
         quiet: bool,
     },
+    /// Show the cached release status without making a network request.
+    Status,
     /// Download, verify, and install the newest release.
     Install {
         /// Install without an interactive confirmation.
