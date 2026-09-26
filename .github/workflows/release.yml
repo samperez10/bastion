@@ -21,14 +21,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-android-arm64
-      - name: Install Android NDK
+      - name: Use preinstalled Android NDK
         run: |
-          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          test -x "$sdkmanager"
-          set +o pipefail
-          yes | "$sdkmanager" --licenses >/dev/null
-          set -o pipefail
-          "$sdkmanager" "ndk;27.2.12479018"
+          test -d "$ANDROID_NDK_LATEST_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
