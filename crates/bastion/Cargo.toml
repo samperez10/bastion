@@ -1,0 +1,13 @@
+[package]
+name = "bastion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+workspace-core = { path = "../workspace-core" }
+workspace-protocol = { path = "../workspace-protocol" }

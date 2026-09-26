@@ -1,0 +1,10 @@
+[package]
+name = "workspace-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bastion's terminal-emulation boundary"
+
+[dependencies]
+alacritty_terminal = "0.26"
+serde.workspace = true

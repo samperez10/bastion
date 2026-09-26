@@ -1,0 +1,16 @@
+[package]
+name = "workspace-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+workspace-terminal = { path = "../workspace-terminal" }
+workspace-core = { path = "../workspace-core" }
+workspace-protocol = { path = "../workspace-protocol" }

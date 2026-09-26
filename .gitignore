@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+
+# Bastion runtime state
+/state/
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.pid
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Release staging
+/dist/
+/artifacts/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.bak

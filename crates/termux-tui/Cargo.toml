@@ -1,0 +1,17 @@
+[package]
+name = "termux-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bastion-audio = { path = "../bastion-audio" }
+workspace-protocol = { path = "../workspace-protocol" }
+workspace-core = { path = "../workspace-core" }
+workspace-terminal = { path = "../workspace-terminal" }

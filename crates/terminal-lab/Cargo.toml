@@ -1,0 +1,18 @@
+[package]
+name = "terminal-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated terminal-emulator compatibility probes for Bastion"
+publish = false
+
+[features]
+default = []
+alacritty = ["dep:alacritty_terminal"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+portable-pty.workspace = true
+bastion-audio = { path = "../bastion-audio" }
+alacritty_terminal = { version = "0.26", optional = true }

@@ -1,0 +1,8 @@
+{
+  "version": "{{VERSION}}",
+  "daemon_revision": {{DAEMON_REVISION}},
+  "target": "aarch64-linux-android",
+  "archive": "bastion-termux-aarch64.tar.gz",
+  "sha256": "{{SHA256}}",
+  "minimum_android_api": 26
+}
