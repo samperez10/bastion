@@ -61,8 +61,11 @@ bastion
 Register or focus a project anywhere in Termux storage:
 
 ```sh
+bastion open .
 bastion open /path/to/project
 ```
+
+Use `bastion open .` from inside a project to register the current directory as a workspace and open it immediately.
 
 Inside Bastion, create tabs and panes, run normal shell commands or supported agents, and press `Ctrl+B` to return from an attached pane to its workspace.
 
