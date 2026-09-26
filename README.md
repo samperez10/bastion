@@ -79,7 +79,7 @@ Closing the TUI leaves the daemon and managed panes running. Lifecycle sounds ar
 
 ## Updates
 
-Bastion checks for releases in the background at most once every 24 hours. Available versions appear under **Settings → Updates**, where they can be installed, deferred, or skipped. Updates are checksum-verified and roll back automatically if activation or daemon restart fails.
+Bastion checks for releases in the background at most once every 24 hours. Automatic checks can be disabled under **Settings → Automatic update checks**. Available versions appear in Settings, where they can be installed, deferred, or skipped. Bastion never installs an update silently. Updates are checksum-verified and roll back automatically if activation or daemon restart fails.
 
 The same controls are available from the command line:
 

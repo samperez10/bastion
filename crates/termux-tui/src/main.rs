@@ -619,7 +619,9 @@ fn pick_workspace(
     let mut settings_open = false;
     let mut update_confirmation = false;
     let mut selected_setting = 0_usize;
-    let mut sound_enabled = Preferences::load(state_dir)?.notifications.sound;
+    let preferences = Preferences::load(state_dir)?;
+    let mut sound_enabled = preferences.notifications.sound;
+    let mut automatic_update_checks = preferences.updates.automatic_checks;
     let result = loop {
         let refreshed_update = cached_update_version(state_dir);
         if refreshed_update != available_update
@@ -716,7 +718,7 @@ fn pick_workspace(
                 );
             }
             if settings_open {
-                let dialog = centered_fixed(50, 8, frame.area());
+                let dialog = centered_fixed(54, 10, frame.area());
                 let selected_style = Style::default()
                     .fg(accent())
                     .bg(focus_background())
@@ -733,19 +735,25 @@ fn pick_workspace(
                     active_theme().name.to_ascii_uppercase()
                 );
                 let updates = format!(
-                    "{} Updates                 {}",
-                    if selected_setting == 2 { "›" } else { " " },
+                    "{} Available update         {}",
+                    if selected_setting == 3 { "›" } else { " " },
                     available_update
                         .as_deref()
                         .map(|version| format!("v{version}"))
                         .unwrap_or_else(|| "CURRENT".to_owned())
+                );
+                let update_checks = format!(
+                    "{} Automatic update checks  {}",
+                    if selected_setting == 2 { "›" } else { " " },
+                    if automatic_update_checks { "ON" } else { "OFF" }
                 );
                 frame.render_widget(WidgetClear, dialog);
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::styled(sound, if selected_setting == 0 { selected_style } else { normal_style }),
                         Line::styled(theme, if selected_setting == 1 { selected_style } else { normal_style }),
-                        Line::styled(updates, if selected_setting == 2 { selected_style } else { normal_style }),
+                        Line::styled(update_checks, if selected_setting == 2 { selected_style } else { normal_style }),
+                        Line::styled(updates, if selected_setting == 3 { selected_style } else { normal_style }),
                         Line::raw(""),
                         Line::styled("  Esc · back", Style::default().fg(muted())),
                     ])
@@ -759,19 +767,34 @@ fn pick_workspace(
                 );
             }
             if update_confirmation {
-                let dialog = centered_fixed(54, 10, frame.area());
+                let dialog = centered_fixed(58, 11, frame.area());
                 let version = available_update.as_deref().unwrap_or("new release");
                 frame.render_widget(WidgetClear, dialog);
                 frame.render_widget(
-                    Paragraph::new(format!(
-                        "Install Bastion v{version}?\n\nThe release will be checksum-verified. A running daemon will restart; saved agent sessions remain available.\n\n  LATER          X SKIP          ENTER UPDATE"
-                    ))
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("Bastion v{version} is ready"),
+                            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::raw("The download is checksum-verified before install."),
+                        Line::raw("Running panes restart; saved agent sessions can resume."),
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::styled("Esc ", Style::default().fg(muted())),
+                            Span::raw("Later     "),
+                            Span::styled("X ", Style::default().fg(muted())),
+                            Span::raw("Skip     "),
+                            Span::styled("Enter ", Style::default().fg(accent())),
+                            Span::styled("Update now", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                        ]),
+                    ])
                     .wrap(Wrap { trim: true })
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(accent()))
-                            .title(" BASTION UPDATE "),
+                            .title(" UPDATE AVAILABLE "),
                     ),
                     dialog,
                 );
@@ -798,7 +821,7 @@ fn pick_workspace(
                     selected_setting = selected_setting.saturating_sub(1)
                 }
                 KeyCode::Down | KeyCode::Char('j') if settings_open => {
-                    selected_setting = (selected_setting + 1).min(2)
+                    selected_setting = (selected_setting + 1).min(3)
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ')
                     if settings_open && !update_confirmation =>
@@ -819,7 +842,19 @@ fn pick_workspace(
                             Ok(name) => format!(" Theme: {name} "),
                             Err(error) => format!(" Theme failed: {error:#} "),
                         };
+                    } else if selected_setting == 2 {
+                        automatic_update_checks = !automatic_update_checks;
+                        match set_update_check_preference(state_dir, automatic_update_checks) {
+                            Ok(()) => {
+                                hint = format!(
+                                    " Automatic update checks: {} ",
+                                    if automatic_update_checks { "ON" } else { "OFF" }
+                                )
+                            }
+                            Err(error) => hint = format!(" Update setting failed: {error:#} "),
+                        }
                     } else if available_update.is_some() {
+                        settings_open = false;
                         update_confirmation = true;
                     } else {
                         hint = " Bastion is up to date ".to_owned();
@@ -864,7 +899,9 @@ fn pick_workspace(
                 KeyCode::Char('s') if !removing => {
                     settings_open = true;
                     selected_setting = 0;
-                    sound_enabled = Preferences::load(state_dir)?.notifications.sound;
+                    let preferences = Preferences::load(state_dir)?;
+                    sound_enabled = preferences.notifications.sound;
+                    automatic_update_checks = preferences.updates.automatic_checks;
                 }
                 KeyCode::Enter if !settings_open => {
                     let root = workspaces[selected]
@@ -911,10 +948,10 @@ fn pick_workspace(
                     && update_confirmation =>
             {
                 let size = terminal.size()?;
-                let dialog = centered_fixed(54, 10, Rect::new(0, 0, size.width, size.height));
+                let dialog = centered_fixed(58, 11, Rect::new(0, 0, size.width, size.height));
                 if !contains(dialog, mouse.column, mouse.row) {
                     update_confirmation = false;
-                } else if mouse.row >= dialog.y.saturating_add(dialog.height.saturating_sub(3)) {
+                } else if mouse.row >= dialog.y.saturating_add(dialog.height.saturating_sub(5)) {
                     let relative = mouse.column.saturating_sub(dialog.x);
                     let region = u32::from(relative) * 3 / u32::from(dialog.width.max(1));
                     match region {
@@ -938,7 +975,7 @@ fn pick_workspace(
                     && settings_open =>
             {
                 let size = terminal.size()?;
-                let dialog = centered_fixed(50, 8, Rect::new(0, 0, size.width, size.height));
+                let dialog = centered_fixed(54, 10, Rect::new(0, 0, size.width, size.height));
                 if !contains(dialog, mouse.column, mouse.row) {
                     settings_open = false;
                 } else if mouse.row == dialog.y.saturating_add(1) {
@@ -954,12 +991,21 @@ fn pick_workspace(
                     }
                 } else if mouse.row == dialog.y.saturating_add(3) {
                     selected_setting = 2;
+                    automatic_update_checks = !automatic_update_checks;
+                    if let Err(error) =
+                        set_update_check_preference(state_dir, automatic_update_checks)
+                    {
+                        hint = format!(" Update setting failed: {error:#} ");
+                    }
+                } else if mouse.row == dialog.y.saturating_add(4) {
+                    selected_setting = 3;
                     if available_update.is_some() {
+                        settings_open = false;
                         update_confirmation = true;
                     } else {
                         hint = " Bastion is up to date ".to_owned();
                     }
-                } else if mouse.row >= dialog.y.saturating_add(5) {
+                } else if mouse.row >= dialog.y.saturating_add(6) {
                     settings_open = false;
                 }
             }
@@ -975,7 +1021,9 @@ fn pick_workspace(
                         0 => {
                             settings_open = true;
                             selected_setting = 0;
-                            sound_enabled = Preferences::load(state_dir)?.notifications.sound;
+                            let preferences = Preferences::load(state_dir)?;
+                            sound_enabled = preferences.notifications.sound;
+                            automatic_update_checks = preferences.updates.automatic_checks;
                         }
                         1 => removing = true,
                         _ => break Ok(None),
@@ -1062,6 +1110,12 @@ fn sibling_binary(name: &str) -> PathBuf {
 fn set_sound_preference(state_dir: &std::path::Path, enabled: bool) -> Result<()> {
     let mut preferences = Preferences::load(state_dir)?;
     preferences.notifications.sound = enabled;
+    preferences.save(state_dir)
+}
+
+fn set_update_check_preference(state_dir: &std::path::Path, enabled: bool) -> Result<()> {
+    let mut preferences = Preferences::load(state_dir)?;
+    preferences.updates.automatic_checks = enabled;
     preferences.save(state_dir)
 }
 

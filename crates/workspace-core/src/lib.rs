@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct Preferences {
     pub notifications: NotificationPreferences,
+    pub updates: UpdatePreferences,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             notifications: NotificationPreferences::default(),
+            updates: UpdatePreferences::default(),
         }
     }
 }
@@ -26,6 +28,20 @@ pub struct NotificationPreferences {
 impl Default for NotificationPreferences {
     fn default() -> Self {
         Self { sound: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatePreferences {
+    pub automatic_checks: bool,
+}
+
+impl Default for UpdatePreferences {
+    fn default() -> Self {
+        Self {
+            automatic_checks: true,
+        }
     }
 }
 
@@ -724,6 +740,14 @@ fn git_dir(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_preferences_enable_update_checks_by_default() {
+        let preferences: Preferences =
+            serde_json::from_str(r#"{"notifications":{"sound":false}}"#).unwrap();
+        assert!(!preferences.notifications.sound);
+        assert!(preferences.updates.automatic_checks);
+    }
 
     #[test]
     fn accepts_an_unregistered_adapter_slot() {

@@ -327,7 +327,9 @@ fn open(state_dir: &PathBuf, path: Option<PathBuf>) -> Result<()> {
     let project = database.ensure_project(&workspace)?;
     database.focus_project(&project)?;
     ensure_daemon(state_dir, &workspace)?;
-    update::refresh_in_background(state_dir);
+    if Preferences::load(state_dir)?.updates.automatic_checks {
+        update::refresh_in_background(state_dir);
+    }
     let mut dashboard = ProcessCommand::new(sibling_binary("termux-tui"));
     dashboard.args(["--state-dir", state_dir.to_string_lossy().as_ref()]);
     if open_last_session {
