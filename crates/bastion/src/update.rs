@@ -185,10 +185,13 @@ fn fetch_release() -> Result<Release> {
 fn install(state_dir: &Path, yes: bool) -> Result<()> {
     ensure_installed_layout()?;
     let cache = check(state_dir, true)?;
-    let release = cache
-        .release
-        .filter(|release| is_newer(&release.version))
-        .context("Bastion is already up to date")?;
+    let Some(release) = cache.release.filter(|release| is_newer(&release.version)) else {
+        println!(
+            "Bastion {} is already up to date.",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    };
     if !yes && !confirm(&release.version)? {
         println!("Update cancelled.");
         return Ok(());
