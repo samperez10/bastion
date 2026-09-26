@@ -384,12 +384,12 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
     }
     write_rollback_snapshot(state_dir, &backup, env!("CARGO_PKG_VERSION"))?;
 
-    let daemon_was_running = daemon_status(&state_dir.to_path_buf()).is_some();
+    let daemon_was_running = daemon_status(state_dir).is_some();
     let daemon_workspace = daemon_was_running
         .then(|| current_workspace(state_dir))
         .transpose()?;
     let stopped = if daemon_was_running {
-        stop_daemon(&state_dir.to_path_buf())?
+        stop_daemon(state_dir)?
     } else {
         0
     };
@@ -399,7 +399,7 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
             return Err(error).context(format!("rollback also failed: {rollback_error:#}"));
         }
         if let Some(workspace) = daemon_workspace.as_ref()
-            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+            && let Err(restart_error) = start_daemon(state_dir, workspace)
         {
             return Err(error).context(format!(
                 "update activation failed; previous binaries were restored but their daemon did not restart: {restart_error:#}"
@@ -408,18 +408,17 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
         return Err(error).context("update activation failed; previous binaries were restored");
     }
 
-    if let Some(workspace) = daemon_workspace.as_ref() {
-        if let Err(error) = start_daemon(&state_dir.to_path_buf(), workspace) {
-            restore(&backup, &destination)
-                .context("new daemon failed and previous binaries could not be restored")?;
-            if let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace) {
-                return Err(error).context(format!(
-                    "new daemon failed; previous binaries were restored but their daemon did not restart: {restart_error:#}"
-                ));
-            }
-            return Err(error)
-                .context("new daemon failed to start; previous binaries were restored");
+    if let Some(workspace) = daemon_workspace.as_ref()
+        && let Err(error) = start_daemon(state_dir, workspace)
+    {
+        restore(&backup, &destination)
+            .context("new daemon failed and previous binaries could not be restored")?;
+        if let Err(restart_error) = start_daemon(state_dir, workspace) {
+            return Err(error).context(format!(
+                "new daemon failed; previous binaries were restored but their daemon did not restart: {restart_error:#}"
+            ));
         }
+        return Err(error).context("new daemon failed to start; previous binaries were restored");
     }
     println!("Updated Bastion to {}.", release.version);
     if stopped > 0 {
@@ -480,12 +479,12 @@ fn rollback(state_dir: &Path, yes: bool) -> Result<()> {
     let destination = installed_bin_dir()?;
     copy_binaries(&destination, &current)?;
 
-    let daemon_was_running = daemon_status(&state_dir.to_path_buf()).is_some();
+    let daemon_was_running = daemon_status(state_dir).is_some();
     let daemon_workspace = daemon_was_running
         .then(|| current_workspace(state_dir))
         .transpose()?;
     let stopped = if daemon_was_running {
-        stop_daemon(&state_dir.to_path_buf())?
+        stop_daemon(state_dir)?
     } else {
         0
     };
@@ -498,7 +497,7 @@ fn rollback(state_dir: &Path, yes: bool) -> Result<()> {
             ));
         }
         if let Some(workspace) = daemon_workspace.as_ref()
-            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+            && let Err(restart_error) = start_daemon(state_dir, workspace)
         {
             return Err(error).context(format!(
                 "rollback failed; current binaries were restored but their daemon did not restart: {restart_error:#}"
@@ -508,11 +507,11 @@ fn rollback(state_dir: &Path, yes: bool) -> Result<()> {
     }
 
     if let Some(workspace) = daemon_workspace.as_ref()
-        && let Err(error) = start_daemon(&state_dir.to_path_buf(), workspace)
+        && let Err(error) = start_daemon(state_dir, workspace)
     {
         restore(&current, &destination)
             .context("rolled-back daemon failed and the current release could not be restored")?;
-        if let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace) {
+        if let Err(restart_error) = start_daemon(state_dir, workspace) {
             return Err(error).context(format!(
                 "rolled-back daemon failed; current binaries were restored but their daemon did not restart: {restart_error:#}"
             ));
@@ -522,12 +521,12 @@ fn rollback(state_dir: &Path, yes: bool) -> Result<()> {
 
     if let Err(error) = write_rollback_snapshot(state_dir, &current, env!("CARGO_PKG_VERSION")) {
         if daemon_was_running {
-            let _ = stop_daemon(&state_dir.to_path_buf());
+            let _ = stop_daemon(state_dir);
         }
         restore(&current, &destination)
             .context("could not rotate rollback backup or restore the current release")?;
         if let Some(workspace) = daemon_workspace.as_ref()
-            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+            && let Err(restart_error) = start_daemon(state_dir, workspace)
         {
             return Err(error).context(format!(
                 "could not preserve the current release; rollback was undone but its daemon did not restart: {restart_error:#}"
@@ -706,11 +705,11 @@ fn download(url: &str, destination: &Path, label: &str, total: u64) -> Result<()
 fn draw_download_progress(frame: &str, label: &str, downloaded: u64, total: u64) -> Result<()> {
     let mut stdout = io::stdout().lock();
     write!(stdout, "\r\x1b[2K{frame} {label}")?;
-    if total > 0 {
-        let percent = downloaded
-            .saturating_mul(100)
-            .min(total.saturating_mul(100))
-            / total;
+    if let Some(percent) = downloaded
+        .saturating_mul(100)
+        .min(total.saturating_mul(100))
+        .checked_div(total)
+    {
         write!(
             stdout,
             "  {percent:>3}% · {} / {}",
@@ -987,9 +986,9 @@ mod tests {
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.10"));
+        assert!(is_newer("0.1.0-alpha.11"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.9"));
+        assert!(!is_newer("0.1.0-alpha.10"));
         assert!(!is_newer("not-a-version"));
     }
 

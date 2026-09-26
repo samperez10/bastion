@@ -19,6 +19,8 @@ fail() {
 command -v curl >/dev/null 2>&1 || fail "curl is required (pkg install curl)"
 command -v tar >/dev/null 2>&1 || fail "tar is required (pkg install tar)"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required (pkg install coreutils)"
+command -v sed >/dev/null 2>&1 || fail "sed is required (pkg install sed)"
+command -v df >/dev/null 2>&1 || fail "df is required (pkg install coreutils)"
 
 [ -n "${PREFIX:-}" ] || fail "PREFIX is not set; run this installer inside Termux"
 [ "$(uname -m)" = "aarch64" ] || fail "the current release supports ARM64 Termux only"
@@ -28,11 +30,23 @@ case "$PREFIX" in
     *) fail "unsupported PREFIX: $PREFIX (the current release supports Termux only)" ;;
 esac
 
+mkdir -p "$PREFIX/bin" || fail "cannot create $PREFIX/bin"
+[ -w "$PREFIX/bin" ] || fail "$PREFIX/bin is not writable"
+
+set -- $(df -Pk "$PREFIX" | tail -n 1)
+AVAILABLE_KB="${4:-0}"
+case "$AVAILABLE_KB" in
+    *[!0-9]*|'') fail "could not determine available storage" ;;
+esac
+[ "$AVAILABLE_KB" -ge 32768 ] || fail "at least 32 MB of free storage is required"
+
 if [ -n "${BASTION_BASE_URL:-}" ]; then
     BASE_URL="$BASTION_BASE_URL"
 elif [ "$VERSION" = "latest" ]; then
-    VERSION="$(curl -fsSL --retry 3 --connect-timeout 15 \
-        "https://api.github.com/repos/${REPOSITORY}/releases?per_page=1" \
+    RELEASES="$(curl -fsSL --retry 3 --connect-timeout 15 \
+        "https://api.github.com/repos/${REPOSITORY}/releases?per_page=1")" \
+        || fail "cannot reach GitHub; check your connection and try again"
+    VERSION="$(printf '%s' "$RELEASES" \
         | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' \
         | sed -n '1p')"
     [ -n "$VERSION" ] || fail "no published Bastion release was found"
@@ -82,9 +96,11 @@ trap interrupted HUP INT TERM
 
 say "Downloading Bastion ${VERSION}…"
 curl -fL --retry 3 --connect-timeout 15 \
-    -o "$WORK_DIR/$ARCHIVE" "$BASE_URL/$ARCHIVE"
+    -o "$WORK_DIR/$ARCHIVE" "$BASE_URL/$ARCHIVE" \
+    || fail "could not download the Bastion release archive"
 curl -fL --retry 3 --connect-timeout 15 \
-    -o "$WORK_DIR/$CHECKSUM" "$BASE_URL/$CHECKSUM"
+    -o "$WORK_DIR/$CHECKSUM" "$BASE_URL/$CHECKSUM" \
+    || fail "could not download the Bastion release checksum"
 
 (
     cd "$WORK_DIR"
@@ -127,20 +143,13 @@ if ! "$PREFIX/bin/bastion" --version >/dev/null 2>&1; then
 fi
 ACTIVATING=0
 
-if [ "${BASTION_SKIP_INTEGRATIONS:-0}" != "1" ]; then
-    if command -v claude >/dev/null 2>&1; then
-        "$PREFIX/bin/workspace-agent" install claude || say "Warning: Claude integration was not installed."
-    fi
-    if command -v codex >/dev/null 2>&1; then
-        "$PREFIX/bin/workspace-agent" install codex || say "Warning: Codex integration was not installed."
-    fi
-    if command -v agy >/dev/null 2>&1; then
-        "$PREFIX/bin/workspace-agent" install antigravity || say "Warning: Antigravity integration was not installed."
-    fi
-fi
-
 say ""
 "$PREFIX/bin/bastion" --version
-"$PREFIX/bin/bastion" doctor
+if [ "${BASTION_SKIP_INTEGRATIONS:-0}" != "1" ]; then
+    "$PREFIX/bin/bastion" doctor --repair \
+        || say "Warning: one or more Bastion checks need attention; run: bastion doctor --repair"
+else
+    "$PREFIX/bin/bastion" doctor
+fi
 say ""
 say "Installed successfully. Run: bastion"

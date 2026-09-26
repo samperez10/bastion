@@ -30,6 +30,14 @@ enum Command {
         #[arg(long, default_value = "primary")]
         slot: String,
     },
+    /// Remove only Bastion-managed hooks and preserve all other agent configuration.
+    Uninstall {
+        #[arg(value_enum)]
+        agent: Agent,
+        /// Agent configuration directory. Defaults to the agent's documented location.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
     /// Read Claude's SessionStart JSON from stdin and report its native session ID.
     ReportClaude {
         #[arg(long, default_value_os_t = default_state_dir())]
@@ -123,6 +131,27 @@ fn main() -> Result<()> {
                 config_dir.unwrap_or_else(antigravity_config_dir),
                 state_dir,
                 &slot,
+            ),
+        },
+        Command::Uninstall { agent, config_dir } => match agent {
+            Agent::Claude => uninstall_json_hooks(
+                config_dir
+                    .unwrap_or_else(claude_config_dir)
+                    .join("settings.json"),
+                &["report-claude"],
+                "Claude",
+            ),
+            Agent::Codex => uninstall_json_hooks(
+                config_dir
+                    .unwrap_or_else(codex_config_dir)
+                    .join("hooks.json"),
+                &["report-codex"],
+                "Codex",
+            ),
+            Agent::Antigravity => uninstall_antigravity(
+                config_dir
+                    .unwrap_or_else(antigravity_config_dir)
+                    .join("hooks.json"),
             ),
         },
         Command::ReportClaude { state_dir, slot } => report_claude(state_dir, &slot),
@@ -506,6 +535,82 @@ fn install_antigravity(config_dir: PathBuf, state_dir: PathBuf, slot: &str) -> R
     Ok(())
 }
 
+fn uninstall_json_hooks(path: PathBuf, markers: &[&str], label: &str) -> Result<()> {
+    if !path.exists() {
+        println!("{label} integration: not installed");
+        return Ok(());
+    }
+    let mut settings: Value = serde_json::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parse {} as JSON", path.display()))?;
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        println!("{label} integration: not installed");
+        return Ok(());
+    };
+    let mut removed = 0_usize;
+    let events = hooks.keys().cloned().collect::<Vec<_>>();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            let Some(commands) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let before = commands.len();
+            commands.retain(|hook| {
+                let command = hook.get("command").and_then(Value::as_str).unwrap_or("");
+                !(command.contains("workspace-agent")
+                    && markers.iter().any(|marker| command.contains(marker)))
+            });
+            removed += before.saturating_sub(commands.len());
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|commands| !commands.is_empty())
+        });
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+    if removed == 0 {
+        println!("{label} integration: not installed");
+        return Ok(());
+    }
+    let backup = path.with_file_name(format!(
+        "{}.bastion-uninstall-backup",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::copy(&path, &backup).with_context(|| format!("back up {}", path.display()))?;
+    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")
+        .with_context(|| format!("write {}", path.display()))?;
+    println!("Removed {label} integration ({removed} managed hook(s)).");
+    Ok(())
+}
+
+fn uninstall_antigravity(path: PathBuf) -> Result<()> {
+    if !path.exists() {
+        println!("Antigravity integration: not installed");
+        return Ok(());
+    }
+    let mut settings: Value = serde_json::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parse {} as JSON", path.display()))?;
+    let Some(root) = settings.as_object_mut() else {
+        anyhow::bail!("Antigravity hooks.json must be a JSON object");
+    };
+    if root.remove("bastion").is_none() {
+        println!("Antigravity integration: not installed");
+        return Ok(());
+    }
+    let backup = path.with_file_name("hooks.json.bastion-uninstall-backup");
+    fs::copy(&path, &backup).with_context(|| format!("back up {}", path.display()))?;
+    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")
+        .with_context(|| format!("write {}", path.display()))?;
+    println!("Removed Antigravity integration.");
+    Ok(())
+}
+
 fn report_antigravity(state_dir: PathBuf, slot: &str) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -677,5 +782,77 @@ fn shell_slot_default(slot: &str) -> Result<&str> {
         anyhow::bail!(
             "slot names for hook integrations may contain only letters, numbers, '_' or '-'"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir(label: &str) -> PathBuf {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bastion-agent-{label}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn uninstall_removes_only_bastion_managed_hooks() {
+        let root = test_dir("uninstall");
+        let path = root.join("settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": "/usr/bin/workspace-agent report-claude"},
+                        {"type": "command", "command": "keep-my-hook"}
+                    ]}],
+                    "Stop": [{"hooks": [
+                        {"type": "command", "command": "/usr/bin/workspace-agent report-claude-state --state done"}
+                    ]}]
+                },
+                "theme": "user-setting"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        uninstall_json_hooks(path.clone(), &["report-claude"], "Claude").unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let rendered = value.to_string();
+        assert!(!rendered.contains("workspace-agent"));
+        assert!(rendered.contains("keep-my-hook"));
+        assert_eq!(value["theme"], "user-setting");
+        assert!(
+            root.join("settings.json.bastion-uninstall-backup")
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_uninstall_preserves_other_hook_groups() {
+        let root = test_dir("antigravity");
+        let path = root.join("hooks.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "bastion": {"PreInvocation": []},
+                "custom": {"PreInvocation": [{"command": "keep"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        uninstall_antigravity(path.clone()).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value.get("bastion").is_none());
+        assert_eq!(value["custom"]["PreInvocation"][0]["command"], "keep");
+        fs::remove_dir_all(root).unwrap();
     }
 }

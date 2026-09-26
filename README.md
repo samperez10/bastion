@@ -16,6 +16,7 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 ## Requirements
 
 - Termux on an ARM64 Android device; the initial release target is Android API 26 or newer.
+- `curl`, `tar`, and `coreutils` for verified release installation and updates.
 - `git`, `rust`, and `clang` when building from source.
 - Claude, Codex, or Antigravity only when using that agent's integration. Ordinary shells work without an AI CLI.
 
@@ -29,7 +30,7 @@ Install the latest ARM64 Termux release:
 curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | sh
 ```
 
-The installer verifies the release checksum before replacing any executable. It automatically enables integrations for supported agent CLIs already present on the device; set `BASTION_SKIP_INTEGRATIONS=1` to skip that step.
+The installer checks the Termux environment, architecture, tools, writable install path, available storage, and GitHub connectivity before activation. It verifies the release checksum before replacing any executable. Supported agent CLIs already on the device are integrated automatically; agents installed later are detected on the next Bastion launch. Set `BASTION_SKIP_INTEGRATIONS=1` to skip integration during installation.
 
 To build from source instead:
 
@@ -76,6 +77,20 @@ State and preferences are stored under:
 ```
 
 Closing the TUI leaves the daemon and managed panes running. Lifecycle sounds are produced by the TUI, so they stop after Bastion is fully exited.
+
+Check the installation or repair agent hooks and a stale daemon with:
+
+```sh
+bastion doctor
+bastion doctor --repair
+```
+
+Uninstalling preserves workspaces and saved session state by default. Project files are never removed:
+
+```sh
+bastion uninstall
+bastion uninstall --purge   # also delete Bastion's local state
+```
 
 ## Updates
 

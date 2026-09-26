@@ -3,20 +3,18 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub notifications: NotificationPreferences,
     pub updates: UpdatePreferences,
+    pub onboarding: OnboardingPreferences,
 }
 
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            notifications: NotificationPreferences::default(),
-            updates: UpdatePreferences::default(),
-        }
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnboardingPreferences {
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +745,7 @@ mod tests {
             serde_json::from_str(r#"{"notifications":{"sound":false}}"#).unwrap();
         assert!(!preferences.notifications.sound);
         assert!(preferences.updates.automatic_checks);
+        assert!(!preferences.onboarding.completed);
     }
 
     #[test]
