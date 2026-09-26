@@ -34,8 +34,12 @@ jobs:
           key: android-arm64
       - name: Install Android NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "ndk;27.2.12479018"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          set +o pipefail
+          yes | "$sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager" "ndk;27.2.12479018"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
