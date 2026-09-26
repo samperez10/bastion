@@ -83,6 +83,12 @@ enum UpdateCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Restore the previously installed Bastion release.
+    Rollback {
+        /// Roll back without an interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Ignore the currently available version until a newer one is released.
     Skip,
 }

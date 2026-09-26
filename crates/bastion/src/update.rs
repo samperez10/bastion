@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -14,6 +14,8 @@ use std::{
 const REPOSITORY: &str = "samperez10/bastion";
 const ARCHIVE: &str = "bastion-termux-aarch64.tar.gz";
 const CHECKSUM: &str = "bastion-termux-aarch64.tar.gz.sha256";
+const ROLLBACK_DIR: &str = "update-rollback";
+const ROLLBACK_METADATA: &str = "metadata.json";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const BINARIES: [&str; 4] = [
     "bastion",
@@ -58,14 +60,124 @@ struct GithubAsset {
     size: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RollbackMetadata {
+    version: String,
+    created_at: u64,
+}
+
+struct StagingDir {
+    path: PathBuf,
+}
+
+struct UpdateLock {
+    path: PathBuf,
+}
+
+impl UpdateLock {
+    fn acquire(state_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("update.lock");
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let active = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<i32>().ok())
+                        .is_some_and(process_is_alive);
+                    if active {
+                        anyhow::bail!("another Bastion update is already running");
+                    }
+                    fs::remove_file(&path).context("remove stale update lock")?;
+                }
+                Err(error) => return Err(error).context("create update lock"),
+            }
+        }
+        anyhow::bail!("could not acquire the Bastion update lock")
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl StagingDir {
+    fn create(state_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(state_dir)?;
+        cleanup_stale_staging(state_dir);
+        let path = state_dir.join(format!(
+            "update-staging-{}-{}",
+            std::process::id(),
+            unix_time()
+        ));
+        if path.exists() {
+            fs::remove_dir_all(&path).context("remove stale update staging directory")?;
+        }
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct PartialDownload {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PartialDownload {
+    fn new(destination: &Path) -> Result<Self> {
+        let path = destination.with_extension("part");
+        if path.exists() {
+            fs::remove_file(&path).context("remove stale partial download")?;
+        }
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self, destination: &Path) -> Result<()> {
+        fs::rename(&self.path, destination).context("commit completed download")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PartialDownload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub(crate) fn command(state_dir: &Path, command: UpdateCommand) -> Result<()> {
     match command {
         UpdateCommand::Check { force: _, quiet } => {
             // Explicit checks are always fresh. The 24-hour limit is enforced
             // before refresh_in_background spawns this command.
-            let cache = check(state_dir, true)?;
-            if !quiet {
-                print_status(&cache);
+            match check(state_dir, true) {
+                Ok(cache) => {
+                    if !quiet {
+                        print_status(&cache);
+                    }
+                }
+                Err(error) => {
+                    if !quiet {
+                        print_offline_error(&error);
+                    }
+                }
             }
             Ok(())
         }
@@ -74,6 +186,7 @@ pub(crate) fn command(state_dir: &Path, command: UpdateCommand) -> Result<()> {
             Ok(())
         }
         UpdateCommand::Install { yes } => install(state_dir, yes),
+        UpdateCommand::Rollback { yes } => rollback(state_dir, yes),
         UpdateCommand::Skip => skip(state_dir),
     }
 }
@@ -208,7 +321,10 @@ fn fetch_release() -> Result<Release> {
 
 fn install(state_dir: &Path, yes: bool) -> Result<()> {
     ensure_installed_layout()?;
-    let cache = check(state_dir, true)?;
+    let _lock = UpdateLock::acquire(state_dir)?;
+    let cache = check(state_dir, true).context(
+        "Could not reach GitHub to check for updates. Bastion was not changed; try again when connected",
+    )?;
     let Some(release) = cache.release.filter(|release| is_newer(&release.version)) else {
         println!(
             "Bastion {} is already up to date.",
@@ -221,15 +337,9 @@ fn install(state_dir: &Path, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(state_dir)?;
-    let staging = state_dir.join(format!("update-staging-{}", std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging).context("remove stale update staging directory")?;
-    }
-    fs::create_dir_all(staging.join("payload"))?;
-    let result = install_from_release(state_dir, &staging, &release);
-    let _ = fs::remove_dir_all(&staging);
-    result
+    let staging = StagingDir::create(state_dir)?;
+    fs::create_dir_all(staging.path.join("payload"))?;
+    install_from_release(state_dir, &staging.path, &release)
 }
 
 fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> Result<()> {
@@ -272,6 +382,7 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
                 .with_context(|| format!("back up {}", target.display()))?;
         }
     }
+    write_rollback_snapshot(state_dir, &backup, env!("CARGO_PKG_VERSION"))?;
 
     let daemon_was_running = daemon_status(&state_dir.to_path_buf()).is_some();
     let daemon_workspace = daemon_was_running
@@ -284,11 +395,15 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
     };
     if let Err(error) = activate(&package, &destination) {
         let rollback_error = restore(&backup, &destination).err();
-        if let Some(workspace) = daemon_workspace.as_ref() {
-            let _ = start_daemon(&state_dir.to_path_buf(), workspace);
-        }
         if let Some(rollback_error) = rollback_error {
             return Err(error).context(format!("rollback also failed: {rollback_error:#}"));
+        }
+        if let Some(workspace) = daemon_workspace.as_ref()
+            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+        {
+            return Err(error).context(format!(
+                "update activation failed; previous binaries were restored but their daemon did not restart: {restart_error:#}"
+            ));
         }
         return Err(error).context("update activation failed; previous binaries were restored");
     }
@@ -297,7 +412,11 @@ fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> 
         if let Err(error) = start_daemon(&state_dir.to_path_buf(), workspace) {
             restore(&backup, &destination)
                 .context("new daemon failed and previous binaries could not be restored")?;
-            let _ = start_daemon(&state_dir.to_path_buf(), workspace);
+            if let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace) {
+                return Err(error).context(format!(
+                    "new daemon failed; previous binaries were restored but their daemon did not restart: {restart_error:#}"
+                ));
+            }
             return Err(error)
                 .context("new daemon failed to start; previous binaries were restored");
         }
@@ -338,6 +457,154 @@ fn restore(backup: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn rollback(state_dir: &Path, yes: bool) -> Result<()> {
+    ensure_installed_layout()?;
+    let _lock = UpdateLock::acquire(state_dir)?;
+    let rollback_root = state_dir.join(ROLLBACK_DIR);
+    let metadata = load_rollback_metadata(&rollback_root)
+        .context("No rollback is available yet. Install at least one Bastion update first")?;
+    if metadata.version == env!("CARGO_PKG_VERSION") {
+        anyhow::bail!("No earlier Bastion release is available to restore");
+    }
+    let package = rollback_root.join("bin");
+    validate_payload(&package, &metadata.version)
+        .context("the local rollback snapshot is incomplete or invalid")?;
+    if !yes && !confirm_rollback(&metadata.version)? {
+        println!("Rollback cancelled.");
+        return Ok(());
+    }
+
+    let staging = StagingDir::create(state_dir)?;
+    let current = staging.path.join("current");
+    fs::create_dir_all(&current)?;
+    let destination = installed_bin_dir()?;
+    copy_binaries(&destination, &current)?;
+
+    let daemon_was_running = daemon_status(&state_dir.to_path_buf()).is_some();
+    let daemon_workspace = daemon_was_running
+        .then(|| current_workspace(state_dir))
+        .transpose()?;
+    let stopped = if daemon_was_running {
+        stop_daemon(&state_dir.to_path_buf())?
+    } else {
+        0
+    };
+
+    if let Err(error) = activate(&package, &destination) {
+        let restore_error = restore(&current, &destination).err();
+        if let Some(restore_error) = restore_error {
+            return Err(error).context(format!(
+                "rollback activation failed and the current release could not be restored: {restore_error:#}"
+            ));
+        }
+        if let Some(workspace) = daemon_workspace.as_ref()
+            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+        {
+            return Err(error).context(format!(
+                "rollback failed; current binaries were restored but their daemon did not restart: {restart_error:#}"
+            ));
+        }
+        return Err(error).context("rollback failed; the current release was restored");
+    }
+
+    if let Some(workspace) = daemon_workspace.as_ref()
+        && let Err(error) = start_daemon(&state_dir.to_path_buf(), workspace)
+    {
+        restore(&current, &destination)
+            .context("rolled-back daemon failed and the current release could not be restored")?;
+        if let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace) {
+            return Err(error).context(format!(
+                "rolled-back daemon failed; current binaries were restored but their daemon did not restart: {restart_error:#}"
+            ));
+        }
+        return Err(error).context("rolled-back daemon failed to start; current release restored");
+    }
+
+    if let Err(error) = write_rollback_snapshot(state_dir, &current, env!("CARGO_PKG_VERSION")) {
+        if daemon_was_running {
+            let _ = stop_daemon(&state_dir.to_path_buf());
+        }
+        restore(&current, &destination)
+            .context("could not rotate rollback backup or restore the current release")?;
+        if let Some(workspace) = daemon_workspace.as_ref()
+            && let Err(restart_error) = start_daemon(&state_dir.to_path_buf(), workspace)
+        {
+            return Err(error).context(format!(
+                "could not preserve the current release; rollback was undone but its daemon did not restart: {restart_error:#}"
+            ));
+        }
+        return Err(error).context("could not preserve the current release; rollback was undone");
+    }
+
+    println!("Rolled Bastion back to {}.", metadata.version);
+    if stopped > 0 {
+        println!(
+            "Restarted the daemon; {stopped} pane(s) were closed and saved agent sessions can resume."
+        );
+    }
+    println!("Run `bastion update rollback` again to restore the version you just replaced.");
+    Ok(())
+}
+
+fn copy_binaries(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for binary in BINARIES {
+        let source = source.join(binary);
+        if !source.is_file() {
+            anyhow::bail!("binary snapshot is missing {binary}");
+        }
+        fs::copy(&source, destination.join(binary))
+            .with_context(|| format!("copy {}", source.display()))?;
+    }
+    Ok(())
+}
+
+fn write_rollback_snapshot(state_dir: &Path, source: &Path, version: &str) -> Result<()> {
+    let destination = state_dir.join(ROLLBACK_DIR);
+    let next = state_dir.join(format!("{ROLLBACK_DIR}.next"));
+    let previous = state_dir.join(format!("{ROLLBACK_DIR}.previous"));
+    if next.exists() {
+        fs::remove_dir_all(&next).context("remove incomplete rollback snapshot")?;
+    }
+    fs::create_dir_all(next.join("bin"))?;
+    if let Err(error) = copy_binaries(source, &next.join("bin")).and_then(|_| {
+        let metadata = RollbackMetadata {
+            version: version.to_owned(),
+            created_at: unix_time(),
+        };
+        fs::write(
+            next.join(ROLLBACK_METADATA),
+            serde_json::to_vec_pretty(&metadata)?,
+        )?;
+        Ok(())
+    }) {
+        let _ = fs::remove_dir_all(&next);
+        return Err(error).context("prepare local rollback snapshot");
+    }
+
+    if previous.exists() {
+        fs::remove_dir_all(&previous).context("remove obsolete rollback snapshot")?;
+    }
+    if destination.exists() {
+        fs::rename(&destination, &previous).context("preserve previous rollback snapshot")?;
+    }
+    if let Err(error) = fs::rename(&next, &destination) {
+        if previous.exists() {
+            let _ = fs::rename(&previous, &destination);
+        }
+        return Err(error).context("activate local rollback snapshot");
+    }
+    if previous.exists() {
+        fs::remove_dir_all(&previous).context("remove replaced rollback snapshot")?;
+    }
+    Ok(())
+}
+
+fn load_rollback_metadata(root: &Path) -> Result<RollbackMetadata> {
+    let value = fs::read(root.join(ROLLBACK_METADATA))?;
+    serde_json::from_slice(&value).context("parse rollback metadata")
+}
+
 fn validate_payload(package: &Path, expected_version: &str) -> Result<()> {
     for binary in BINARIES {
         let path = package.join(binary);
@@ -376,9 +643,18 @@ fn download(url: &str, destination: &Path, label: &str, total: u64) -> Result<()
     if !interactive {
         println!("{label}…");
     }
+    let partial = PartialDownload::new(destination)?;
     let mut child = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "--connect-timeout", "10", "-o"])
-        .arg(destination)
+        .args([
+            "-fsSL",
+            "--remove-on-error",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "-o",
+        ])
+        .arg(&partial.path)
         .arg(url)
         .stderr(Stdio::piped())
         .spawn()
@@ -390,7 +666,7 @@ fn download(url: &str, destination: &Path, label: &str, total: u64) -> Result<()
             break status;
         }
         if interactive {
-            let downloaded = fs::metadata(destination)
+            let downloaded = fs::metadata(&partial.path)
                 .map(|meta| meta.len())
                 .unwrap_or(0);
             draw_download_progress(frames[frame % frames.len()], label, downloaded, total)?;
@@ -412,9 +688,10 @@ fn download(url: &str, destination: &Path, label: &str, total: u64) -> Result<()
         }
         anyhow::bail!("{label} failed: {detail}");
     }
-    let downloaded = fs::metadata(destination)
+    let downloaded = fs::metadata(&partial.path)
         .map(|meta| meta.len())
         .unwrap_or(total);
+    partial.commit(destination)?;
     if interactive {
         clear_progress_line()?;
     }
@@ -552,8 +829,25 @@ fn print_status(cache: &UpdateCache) {
     }
 }
 
+fn print_offline_error(error: &anyhow::Error) {
+    println!("Could not check GitHub for Bastion updates.");
+    println!("Bastion remains available offline; try again when connected.");
+    println!("Details: {error:#}");
+}
+
 fn confirm(version: &str) -> Result<bool> {
     print!("Install Bastion {version} and restart its daemon if running? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn confirm_rollback(version: &str) -> Result<bool> {
+    print!("Restore Bastion {version} from the local rollback snapshot? [y/N] ");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -613,6 +907,28 @@ fn unix_time() -> u64 {
         .as_secs()
 }
 
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn cleanup_stale_staging(state_dir: &Path) {
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("update-staging-")
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 fn cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join("update.json")
 }
@@ -637,12 +953,43 @@ fn save_cache(state_dir: &Path, cache: &UpdateCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bastion-update-{label}-{}-{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_fake_binaries(directory: &Path, marker: &str) {
+        fs::create_dir_all(directory).unwrap();
+        for binary in BINARIES {
+            fs::write(directory.join(binary), format!("{binary}-{marker}")).unwrap();
+        }
+    }
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.8"));
+        assert!(is_newer("0.1.0-alpha.9"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.7"));
+        assert!(!is_newer("0.1.0-alpha.8"));
         assert!(!is_newer("not-a-version"));
     }
 
@@ -662,5 +1009,85 @@ mod tests {
         assert_eq!(format_bytes(96), "96 B");
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn partial_download_is_removed_until_committed() {
+        let root = TestDir::new("partial");
+        let destination = root.0.join("release.tar.gz");
+        let partial = PartialDownload::new(&destination).unwrap();
+        fs::write(&partial.path, b"incomplete").unwrap();
+        let partial_path = partial.path.clone();
+        drop(partial);
+        assert!(!partial_path.exists());
+        assert!(!destination.exists());
+
+        let partial = PartialDownload::new(&destination).unwrap();
+        fs::write(&partial.path, b"complete").unwrap();
+        partial.commit(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn rejects_a_mismatched_release_checksum() {
+        let root = TestDir::new("checksum");
+        let archive = root.0.join("archive");
+        let checksum = root.0.join("archive.sha256");
+        fs::write(&archive, b"real package").unwrap();
+        fs::write(&checksum, format!("{}  archive\n", "0".repeat(64))).unwrap();
+        let error = verify_checksum(&archive, &checksum).unwrap_err();
+        assert!(format!("{error:#}").contains("checksum verification failed"));
+    }
+
+    #[test]
+    fn rollback_snapshot_is_durable_and_rotates_atomically() {
+        let root = TestDir::new("rollback");
+        let first = root.0.join("first");
+        let second = root.0.join("second");
+        write_fake_binaries(&first, "one");
+        write_fake_binaries(&second, "two");
+
+        write_rollback_snapshot(&root.0, &first, "1.0.0").unwrap();
+        let metadata = load_rollback_metadata(&root.0.join(ROLLBACK_DIR)).unwrap();
+        assert_eq!(metadata.version, "1.0.0");
+        assert_eq!(
+            fs::read_to_string(root.0.join(ROLLBACK_DIR).join("bin/bastion")).unwrap(),
+            "bastion-one"
+        );
+
+        write_rollback_snapshot(&root.0, &second, "2.0.0").unwrap();
+        let metadata = load_rollback_metadata(&root.0.join(ROLLBACK_DIR)).unwrap();
+        assert_eq!(metadata.version, "2.0.0");
+        assert_eq!(
+            fs::read_to_string(root.0.join(ROLLBACK_DIR).join("bin/bastion")).unwrap(),
+            "bastion-two"
+        );
+        assert!(!root.0.join(format!("{ROLLBACK_DIR}.next")).exists());
+        assert!(!root.0.join(format!("{ROLLBACK_DIR}.previous")).exists());
+    }
+
+    #[test]
+    fn updater_lock_prevents_parallel_mutation_and_recovers_stale_locks() {
+        let root = TestDir::new("lock");
+        let lock = UpdateLock::acquire(&root.0).unwrap();
+        assert!(UpdateLock::acquire(&root.0).is_err());
+        drop(lock);
+        fs::write(root.0.join("update.lock"), "99999999\n").unwrap();
+        let recovered = UpdateLock::acquire(&root.0).unwrap();
+        drop(recovered);
+        assert!(!root.0.join("update.lock").exists());
+    }
+
+    #[test]
+    fn staging_cleanup_removes_abandoned_downloads() {
+        let root = TestDir::new("staging");
+        let abandoned = root.0.join("update-staging-abandoned");
+        fs::create_dir_all(&abandoned).unwrap();
+        fs::write(abandoned.join("release.part"), b"partial").unwrap();
+        let staging = StagingDir::create(&root.0).unwrap();
+        assert!(!abandoned.exists());
+        let active = staging.path.clone();
+        drop(staging);
+        assert!(!active.exists());
     }
 }
