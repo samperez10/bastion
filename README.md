@@ -21,9 +21,17 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 
 Notification sounds use Android's native AAudio library directly. Bastion does **not** require Termux:API, `termux-notification`, tmux, a browser, or an external SQLite installation.
 
-## Build and install
+## Install
 
-Until prebuilt releases are available, build inside Termux:
+Install the latest ARM64 Termux release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | sh
+```
+
+The installer verifies the release checksum before replacing any executable. It automatically enables integrations for supported agent CLIs already present on the device; set `BASTION_SKIP_INTEGRATIONS=1` to skip that step.
+
+To build from source instead:
 
 ```sh
 pkg install git rust clang

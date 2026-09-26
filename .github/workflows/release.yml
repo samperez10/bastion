@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Termux ARM64 release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android-arm64
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;27.2.12479018"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Resolve and verify version
+        id: version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "bastion") | .version')"
+          tag="${GITHUB_REF_NAME:-v$version}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$tag" != "v$version" ]]; then
+            echo "Tag $tag does not match Cargo version v$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: >-
+          cargo ndk -t arm64-v8a -p 26 build --release --locked
+          -p bastion
+          -p workspace-daemon
+          -p termux-tui
+          -p workspace-agent
+
+      - name: Package and checksum
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          package="dist/bastion-termux-aarch64"
+          mkdir -p "$package/bin"
+          for binary in bastion workspace-daemon termux-tui workspace-agent; do
+            install -m 755 "target/aarch64-linux-android/release/$binary" "$package/bin/$binary"
+          done
+          install -m 644 README.md LICENSE-MIT LICENSE-APACHE "$package/"
+          daemon_revision="$(sed -n 's/^pub const DAEMON_REVISION: u32 = \([0-9][0-9]*\);/\1/p' crates/workspace-protocol/src/lib.rs)"
+          archive="bastion-termux-aarch64.tar.gz"
+          tar -C dist -czf "dist/$archive" bastion-termux-aarch64
+          sha256="$(sha256sum "dist/$archive" | awk '{print $1}')"
+          printf '%s  %s\n' "$sha256" "$archive" > "dist/$archive.sha256"
+          sed \
+            -e "s/{{VERSION}}/$VERSION/g" \
+            -e "s/{{DAEMON_REVISION}}/$daemon_revision/g" \
+            -e "s/{{SHA256}}/$sha256/g" \
+            packaging/release.json.in > dist/release.json
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bastion-termux-aarch64
+          path: |
+            dist/bastion-termux-aarch64.tar.gz
+            dist/bastion-termux-aarch64.tar.gz.sha256
+            dist/release.json
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/bastion-termux-aarch64.tar.gz
+            dist/bastion-termux-aarch64.tar.gz.sha256
+            dist/release.json
