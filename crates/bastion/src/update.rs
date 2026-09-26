@@ -4,9 +4,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -37,6 +38,10 @@ pub(crate) struct Release {
     pub tag: String,
     pub archive_url: String,
     pub checksum_url: String,
+    #[serde(default)]
+    pub archive_size: u64,
+    #[serde(default)]
+    pub checksum_size: u64,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +55,7 @@ struct GithubRelease {
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+    size: u64,
 }
 
 pub(crate) fn command(state_dir: &Path, command: UpdateCommand) -> Result<()> {
@@ -167,12 +173,22 @@ fn fetch_release() -> Result<Release> {
                 .find(|asset| asset.name == ARCHIVE)?
                 .browser_download_url
                 .clone();
+            let archive_size = release
+                .assets
+                .iter()
+                .find(|asset| asset.name == ARCHIVE)?
+                .size;
             let checksum_url = release
                 .assets
                 .iter()
                 .find(|asset| asset.name == CHECKSUM)?
                 .browser_download_url
                 .clone();
+            let checksum_size = release
+                .assets
+                .iter()
+                .find(|asset| asset.name == CHECKSUM)?
+                .size;
             Some((
                 parsed,
                 Release {
@@ -180,6 +196,8 @@ fn fetch_release() -> Result<Release> {
                     tag: release.tag_name,
                     archive_url,
                     checksum_url,
+                    archive_size,
+                    checksum_size,
                 },
             ))
         })
@@ -217,8 +235,18 @@ fn install(state_dir: &Path, yes: bool) -> Result<()> {
 fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> Result<()> {
     let archive = staging.join(ARCHIVE);
     let checksum = staging.join(CHECKSUM);
-    download(&release.archive_url, &archive, "release archive")?;
-    download(&release.checksum_url, &checksum, "release checksum")?;
+    download(
+        &release.archive_url,
+        &archive,
+        "Downloading update",
+        release.archive_size,
+    )?;
+    download(
+        &release.checksum_url,
+        &checksum,
+        "Downloading checksum",
+        release.checksum_size,
+    )?;
     verify_checksum(&archive, &checksum)?;
 
     let status = Command::new("tar")
@@ -343,22 +371,111 @@ fn validate_payload(package: &Path, expected_version: &str) -> Result<()> {
     Ok(())
 }
 
-fn download(url: &str, destination: &Path, label: &str) -> Result<()> {
-    println!("Downloading {label}…");
-    let status = Command::new("curl")
-        .args(["-fL", "--retry", "3", "--connect-timeout", "10", "-o"])
+fn download(url: &str, destination: &Path, label: &str, total: u64) -> Result<()> {
+    let interactive = io::stdout().is_terminal();
+    if !interactive {
+        println!("{label}…");
+    }
+    let mut child = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--connect-timeout", "10", "-o"])
         .arg(destination)
         .arg(url)
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("download {label}"))?;
-    if status.success() {
-        Ok(())
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame = 0_usize;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for curl download")? {
+            break status;
+        }
+        if interactive {
+            let downloaded = fs::metadata(destination)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            draw_download_progress(frames[frame % frames.len()], label, downloaded, total)?;
+            frame += 1;
+        }
+        thread::sleep(Duration::from_millis(90));
+    };
+    let mut error = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut error);
+    }
+    if !status.success() {
+        if interactive {
+            clear_progress_line()?;
+        }
+        let detail = error.trim();
+        if detail.is_empty() {
+            anyhow::bail!("{label} failed: {status}");
+        }
+        anyhow::bail!("{label} failed: {detail}");
+    }
+    let downloaded = fs::metadata(destination)
+        .map(|meta| meta.len())
+        .unwrap_or(total);
+    if interactive {
+        clear_progress_line()?;
+    }
+    println!(
+        "✓ {} · {}",
+        completed_label(label),
+        format_bytes(downloaded)
+    );
+    Ok(())
+}
+
+fn draw_download_progress(frame: &str, label: &str, downloaded: u64, total: u64) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\r\x1b[2K{frame} {label}")?;
+    if total > 0 {
+        let percent = downloaded
+            .saturating_mul(100)
+            .min(total.saturating_mul(100))
+            / total;
+        write!(
+            stdout,
+            "  {percent:>3}% · {} / {}",
+            format_bytes(downloaded),
+            format_bytes(total)
+        )?;
+    } else if downloaded > 0 {
+        write!(stdout, " · {}", format_bytes(downloaded))?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn clear_progress_line() -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\r\x1b[2K")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn completed_label(label: &str) -> &str {
+    match label {
+        "Downloading update" => "Download complete",
+        "Downloading checksum" => "Checksum received",
+        value => value,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / KIB)
     } else {
-        anyhow::bail!("{label} download failed: {status}")
+        format!("{bytes} B")
     }
 }
 
 fn verify_checksum(archive: &Path, checksum: &Path) -> Result<()> {
+    let interactive = io::stdout().is_terminal();
     let expected = fs::read_to_string(checksum)?
         .split_whitespace()
         .next()
@@ -371,11 +488,20 @@ fn verify_checksum(archive: &Path, checksum: &Path) -> Result<()> {
     {
         anyhow::bail!("release checksum is invalid");
     }
+    if interactive {
+        print!("⠋ Verifying package…");
+        io::stdout().flush()?;
+    } else {
+        println!("Verifying package…");
+    }
     let output = Command::new("sha256sum")
         .arg(archive)
         .output()
         .context("calculate release checksum")?;
     if !output.status.success() {
+        if interactive {
+            clear_progress_line()?;
+        }
         anyhow::bail!("sha256sum failed: {}", output.status);
     }
     let actual = String::from_utf8_lossy(&output.stdout)
@@ -384,9 +510,15 @@ fn verify_checksum(archive: &Path, checksum: &Path) -> Result<()> {
         .unwrap_or("")
         .to_ascii_lowercase();
     if actual != expected {
+        if interactive {
+            clear_progress_line()?;
+        }
         anyhow::bail!("release checksum verification failed");
     }
-    println!("Release checksum verified.");
+    if interactive {
+        clear_progress_line()?;
+    }
+    println!("✓ Package verified");
     Ok(())
 }
 
@@ -508,9 +640,9 @@ mod tests {
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.6"));
+        assert!(is_newer("0.1.0-alpha.7"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.5"));
+        assert!(!is_newer("0.1.0-alpha.6"));
         assert!(!is_newer("not-a-version"));
     }
 
@@ -523,5 +655,12 @@ mod tests {
         assert!(!is_due(&cache));
         cache.checked_at = 0;
         assert!(is_due(&cache));
+    }
+
+    #[test]
+    fn formats_progress_sizes_for_people() {
+        assert_eq!(format_bytes(96), "96 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 }
