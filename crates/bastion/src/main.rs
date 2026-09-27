@@ -582,17 +582,10 @@ fn show_first_run(state_dir: &Path, workspace: &Path) -> Result<()> {
         return Ok(());
     }
     println!();
-    println!("╭─ BASTION · QUICK START ─────────────────────╮");
-    println!("│ Persistent workspaces for coding agents     │");
-    println!("├─────────────────────────────────────────────┤");
-    println!("│ Enter / tap   Open the selected workspace   │");
-    println!("│ +PANE         Create a managed terminal     │");
-    println!("│ Ctrl+B        Return from a pane             │");
-    println!("│ Settings      Themes, sounds, and updates    │");
-    println!("├─────────────────────────────────────────────┤");
-    println!("│ Workspace: {:<34}│", compact_path(workspace, 34));
-    println!("╰─────────────────────────────────────────────╯");
-    print!("Press Enter to continue… ");
+    for line in onboarding_screen(workspace, terminal_columns()) {
+        println!("{line}");
+    }
+    print!("› ");
     std::io::stdout().flush()?;
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
@@ -600,6 +593,100 @@ fn show_first_run(state_dir: &Path, workspace: &Path) -> Result<()> {
     preferences.save(state_dir)?;
     println!();
     Ok(())
+}
+
+fn terminal_columns() -> usize {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    if result == 0 {
+        let columns = unsafe { size.assume_init() }.ws_col as usize;
+        if columns > 0 {
+            return columns;
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(48)
+}
+
+fn onboarding_screen(workspace: &Path, columns: usize) -> Vec<String> {
+    let width = columns.clamp(40, 82);
+    let inner = width - 2;
+    let wide = width >= 64;
+    let mut lines = vec![
+        framed_border('┌', '┐', inner),
+        framed_split("  ▪ ▪ ▪", "B A S T I O N  ", inner),
+        framed_border('├', '┤', inner),
+        framed_line("  ▟█▙▟█▙   QUICK START", inner),
+        framed_line("  ██████   Your agents. Your workspaces.", inner),
+        framed_line("  ██▛▜██   Ready when you return.", inner),
+        framed_border('├', '┤', inner),
+    ];
+    if wide {
+        lines.push(framed_split(
+            "  1  Select or add a workspace",
+            "3  Ctrl+B returns from a pane  ",
+            inner,
+        ));
+        lines.push(framed_split(
+            "  2  Create a pane; run any agent",
+            "4  Use ⋯ to manage tabs and panes  ",
+            inner,
+        ));
+    } else {
+        lines.extend([
+            framed_line("  1  Select or add a workspace", inner),
+            framed_line("  2  Create a pane; run any agent", inner),
+            framed_line("  3  Ctrl+B returns from a pane", inner),
+            framed_line("  4  Use ⋯ to manage tabs and panes", inner),
+        ]);
+    }
+    lines.push(framed_border('├', '┤', inner));
+    let path_width = inner.saturating_sub("  ENTER CONTINUE  ".chars().count() + 1);
+    lines.push(framed_split(
+        &format!(
+            "  {}",
+            compact_path(workspace, path_width.saturating_sub(2))
+        ),
+        "ENTER CONTINUE  ",
+        inner,
+    ));
+    lines.push(framed_border('└', '┘', inner));
+    lines
+}
+
+fn framed_border(left: char, right: char, inner: usize) -> String {
+    format!("{left}{}{right}", "─".repeat(inner))
+}
+
+fn framed_line(content: &str, inner: usize) -> String {
+    let content = truncate_end(content, inner);
+    let padding = inner.saturating_sub(content.chars().count());
+    format!("│{content}{}│", " ".repeat(padding))
+}
+
+fn framed_split(left: &str, right: &str, inner: usize) -> String {
+    let right = truncate_end(right, inner);
+    let right_width = right.chars().count();
+    let left_width = inner.saturating_sub(right_width + usize::from(right_width > 0));
+    let left = truncate_end(left, left_width);
+    let spacing = inner.saturating_sub(left.chars().count() + right_width);
+    format!("│{left}{}{right}│", " ".repeat(spacing))
+}
+
+fn truncate_end(value: &str, width: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    format!("{}…", characters[..width - 1].iter().collect::<String>())
 }
 
 fn compact_path(path: &std::path::Path, width: usize) -> String {
@@ -1188,5 +1275,19 @@ mod tests {
     fn onboarding_paths_fit_the_compact_header() {
         let path = PathBuf::from("/a/very/long/workspace/path/that/exceeds/mobile-width");
         assert!(compact_path(&path, 24).chars().count() <= 24);
+    }
+
+    #[test]
+    fn onboarding_reflows_for_portrait_and_landscape() {
+        let workspace = PathBuf::from("/a/very/long/workspace/path/for/mobile");
+        let portrait = onboarding_screen(&workspace, 44);
+        let landscape = onboarding_screen(&workspace, 80);
+
+        assert!(portrait.iter().all(|line| line.chars().count() == 44));
+        assert!(landscape.iter().all(|line| line.chars().count() == 80));
+        assert_eq!(portrait.len(), 14);
+        assert_eq!(landscape.len(), 12);
+        assert!(portrait.iter().any(|line| line.contains("Ctrl+B")));
+        assert!(landscape.iter().any(|line| line.contains("tabs and panes")));
     }
 }
