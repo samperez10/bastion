@@ -23,6 +23,8 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 
 Notification sounds use Android's native AAudio library directly. Bastion does **not** require Termux:API, `termux-notification`, tmux, a browser, or an external SQLite installation.
 
+Bastion's interface includes its original palettes plus adaptations of [Tokyo Night](https://github.com/folke/tokyonight.nvim), [Catppuccin Mocha](https://github.com/catppuccin/catppuccin), [Gruvbox Dark](https://github.com/morhetz/gruvbox), [Solarized Dark and Light](https://github.com/altercation/solarized), [Dracula](https://github.com/dracula/dracula-theme), and [Nord](https://github.com/nordtheme/nord). Themes style Bastion's own chrome only; agent and shell panes retain their native terminal colors.
+
 ## Install
 
 Install the latest ARM64 Termux release:

@@ -46,6 +46,9 @@ use workspace_terminal::MouseProtocol;
 #[derive(Clone, Copy)]
 struct Theme {
     name: &'static str,
+    foreground: Color,
+    background: Color,
+    selection_foreground: Color,
     accent: Color,
     border: Color,
     muted: Color,
@@ -55,9 +58,12 @@ struct Theme {
     error: Color,
 }
 
-const THEMES: [Theme; 7] = [
+const THEMES: [Theme; 14] = [
     Theme {
         name: "mono",
+        foreground: Color::White,
+        background: Color::Black,
+        selection_foreground: Color::White,
         accent: Color::White,
         border: Color::Gray,
         muted: Color::DarkGray,
@@ -68,6 +74,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "cyan",
+        foreground: Color::Rgb(225, 245, 245),
+        background: Color::Rgb(6, 18, 20),
+        selection_foreground: Color::White,
         accent: Color::Rgb(55, 225, 220),
         border: Color::Rgb(35, 140, 145),
         muted: Color::Rgb(100, 145, 150),
@@ -78,6 +87,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "amber",
+        foreground: Color::Rgb(245, 232, 205),
+        background: Color::Rgb(24, 17, 8),
+        selection_foreground: Color::White,
         accent: Color::Rgb(255, 190, 75),
         border: Color::Rgb(165, 112, 30),
         muted: Color::Rgb(165, 135, 90),
@@ -88,6 +100,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "violet",
+        foreground: Color::Rgb(238, 230, 250),
+        background: Color::Rgb(18, 12, 30),
+        selection_foreground: Color::White,
         accent: Color::Rgb(190, 145, 255),
         border: Color::Rgb(115, 80, 180),
         muted: Color::Rgb(150, 130, 180),
@@ -98,6 +113,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "forest",
+        foreground: Color::Rgb(225, 242, 229),
+        background: Color::Rgb(8, 22, 14),
+        selection_foreground: Color::White,
         accent: Color::Rgb(105, 215, 145),
         border: Color::Rgb(55, 130, 85),
         muted: Color::Rgb(110, 155, 120),
@@ -108,6 +126,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "rose",
+        foreground: Color::Rgb(250, 230, 239),
+        background: Color::Rgb(27, 12, 19),
+        selection_foreground: Color::White,
         accent: Color::Rgb(255, 135, 180),
         border: Color::Rgb(175, 75, 120),
         muted: Color::Rgb(180, 125, 150),
@@ -118,6 +139,9 @@ const THEMES: [Theme; 7] = [
     },
     Theme {
         name: "high-contrast",
+        foreground: Color::White,
+        background: Color::Black,
+        selection_foreground: Color::White,
         accent: Color::White,
         border: Color::White,
         muted: Color::Gray,
@@ -126,11 +150,118 @@ const THEMES: [Theme; 7] = [
         warning: Color::Yellow,
         error: Color::Red,
     },
+    Theme {
+        name: "tokyo-night",
+        foreground: Color::Rgb(192, 202, 245),
+        background: Color::Rgb(36, 40, 59),
+        selection_foreground: Color::Rgb(192, 202, 245),
+        accent: Color::Rgb(122, 162, 247),
+        border: Color::Rgb(86, 95, 137),
+        muted: Color::Rgb(154, 165, 206),
+        focus_background: Color::Rgb(59, 66, 97),
+        success: Color::Rgb(158, 206, 106),
+        warning: Color::Rgb(224, 175, 104),
+        error: Color::Rgb(247, 118, 142),
+    },
+    Theme {
+        name: "catppuccin-mocha",
+        foreground: Color::Rgb(205, 214, 244),
+        background: Color::Rgb(30, 30, 46),
+        selection_foreground: Color::Rgb(205, 214, 244),
+        accent: Color::Rgb(203, 166, 247),
+        border: Color::Rgb(108, 112, 134),
+        muted: Color::Rgb(166, 173, 200),
+        focus_background: Color::Rgb(69, 71, 90),
+        success: Color::Rgb(166, 227, 161),
+        warning: Color::Rgb(249, 226, 175),
+        error: Color::Rgb(243, 139, 168),
+    },
+    Theme {
+        name: "gruvbox-dark",
+        foreground: Color::Rgb(235, 219, 178),
+        background: Color::Rgb(40, 40, 40),
+        selection_foreground: Color::Rgb(251, 241, 199),
+        accent: Color::Rgb(250, 189, 47),
+        border: Color::Rgb(102, 92, 84),
+        muted: Color::Rgb(168, 153, 132),
+        focus_background: Color::Rgb(80, 73, 69),
+        success: Color::Rgb(184, 187, 38),
+        warning: Color::Rgb(254, 128, 25),
+        error: Color::Rgb(251, 73, 52),
+    },
+    Theme {
+        name: "solarized-dark",
+        foreground: Color::Rgb(131, 148, 150),
+        background: Color::Rgb(0, 43, 54),
+        selection_foreground: Color::Rgb(147, 161, 161),
+        accent: Color::Rgb(38, 139, 210),
+        border: Color::Rgb(88, 110, 117),
+        muted: Color::Rgb(101, 123, 131),
+        focus_background: Color::Rgb(7, 54, 66),
+        success: Color::Rgb(133, 153, 0),
+        warning: Color::Rgb(181, 137, 0),
+        error: Color::Rgb(220, 50, 47),
+    },
+    Theme {
+        name: "solarized-light",
+        foreground: Color::Rgb(88, 110, 117),
+        background: Color::Rgb(253, 246, 227),
+        selection_foreground: Color::Rgb(7, 54, 66),
+        accent: Color::Rgb(38, 139, 210),
+        border: Color::Rgb(147, 161, 161),
+        muted: Color::Rgb(101, 123, 131),
+        focus_background: Color::Rgb(238, 232, 213),
+        success: Color::Rgb(133, 153, 0),
+        warning: Color::Rgb(181, 137, 0),
+        error: Color::Rgb(220, 50, 47),
+    },
+    Theme {
+        name: "dracula",
+        foreground: Color::Rgb(248, 248, 242),
+        background: Color::Rgb(40, 42, 54),
+        selection_foreground: Color::Rgb(248, 248, 242),
+        accent: Color::Rgb(189, 147, 249),
+        border: Color::Rgb(98, 114, 164),
+        muted: Color::Rgb(98, 114, 164),
+        focus_background: Color::Rgb(68, 71, 90),
+        success: Color::Rgb(80, 250, 123),
+        warning: Color::Rgb(241, 250, 140),
+        error: Color::Rgb(255, 85, 85),
+    },
+    Theme {
+        name: "nord",
+        foreground: Color::Rgb(216, 222, 233),
+        background: Color::Rgb(46, 52, 64),
+        selection_foreground: Color::Rgb(236, 239, 244),
+        accent: Color::Rgb(136, 192, 208),
+        border: Color::Rgb(76, 86, 106),
+        muted: Color::Rgb(129, 161, 193),
+        focus_background: Color::Rgb(59, 66, 82),
+        success: Color::Rgb(163, 190, 140),
+        warning: Color::Rgb(235, 203, 139),
+        error: Color::Rgb(191, 97, 106),
+    },
 ];
 static ACTIVE_THEME: OnceLock<Mutex<Theme>> = OnceLock::new();
 
 fn accent() -> Color {
     active_theme().accent
+}
+
+fn foreground() -> Color {
+    active_theme().foreground
+}
+
+fn background() -> Color {
+    active_theme().background
+}
+
+fn selection_foreground() -> Color {
+    active_theme().selection_foreground
+}
+
+fn chrome_style() -> Style {
+    Style::default().fg(foreground()).bg(background())
 }
 
 fn active_theme() -> Theme {
@@ -173,12 +304,17 @@ fn find_theme(name: &str) -> Option<Theme> {
     let name = match name {
         // Preserve old persisted settings from the prototype theme picker.
         "terminal" => "mono",
-        "nord" => "cyan",
-        "tokyo-night" => "violet",
-        "gruvbox" => "amber",
+        "gruvbox" => "gruvbox-dark",
         value => value,
     };
     THEMES.iter().copied().find(|theme| theme.name == name)
+}
+
+fn save_theme(state_dir: &std::path::Path, theme: Theme) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::write(theme_path(state_dir), format!("{}\n", theme.name))?;
+    set_theme(theme);
+    Ok(())
 }
 
 fn set_theme(theme: Theme) {
@@ -197,7 +333,7 @@ fn load_theme(state_dir: &std::path::Path) {
     }
 }
 
-fn theme_command(state_dir: &PathBuf, name: Option<&str>) -> Result<()> {
+fn theme_command(state_dir: &Path, name: Option<&str>) -> Result<()> {
     match name {
         None | Some("list") => {
             println!(
@@ -211,16 +347,14 @@ fn theme_command(state_dir: &PathBuf, name: Option<&str>) -> Result<()> {
         }
         Some(name) => {
             let theme = find_theme(name).context("unknown theme; run `termux-tui theme list`")?;
-            std::fs::create_dir_all(state_dir)?;
-            std::fs::write(theme_path(state_dir), format!("{}\n", theme.name))?;
-            set_theme(theme);
+            save_theme(state_dir, theme)?;
             println!("theme: {}", theme.name);
         }
     }
     Ok(())
 }
 
-fn cycle_theme(state_dir: &PathBuf) -> Result<&'static str> {
+fn cycle_theme(state_dir: &Path) -> Result<&'static str> {
     let current = *ACTIVE_THEME
         .get_or_init(|| Mutex::new(THEMES[1]))
         .lock()
@@ -230,9 +364,7 @@ fn cycle_theme(state_dir: &PathBuf) -> Result<&'static str> {
         .position(|theme| theme.name == current.name)
         .unwrap_or(0);
     let next = THEMES[(index + 1) % THEMES.len()];
-    std::fs::create_dir_all(state_dir)?;
-    std::fs::write(theme_path(state_dir), format!("{}\n", next.name))?;
-    set_theme(next);
+    save_theme(state_dir, next)?;
     Ok(next.name)
 }
 
@@ -411,7 +543,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn dashboard(state_dir: &PathBuf, cwd: Option<&PathBuf>) -> Result<()> {
+fn dashboard(state_dir: &Path, cwd: Option<&PathBuf>) -> Result<()> {
     load_theme(state_dir);
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -426,7 +558,7 @@ fn dashboard(state_dir: &PathBuf, cwd: Option<&PathBuf>) -> Result<()> {
         EnableBracketedPaste
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let notification_listener = NotificationListener::start(state_dir.clone());
+    let notification_listener = NotificationListener::start(state_dir.to_path_buf());
     let result = dashboard_in_session(&mut terminal, state_dir, cwd, &notification_listener);
     disable_raw_mode()?;
     execute!(
@@ -441,7 +573,7 @@ fn dashboard(state_dir: &PathBuf, cwd: Option<&PathBuf>) -> Result<()> {
 
 fn dashboard_in_session(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     cwd: Option<&PathBuf>,
     notification_listener: &NotificationListener,
 ) -> Result<()> {
@@ -521,7 +653,7 @@ fn dashboard_in_session(
 
 /// The outer Bastion session switcher. Closing a workspace dashboard returns
 /// here instead of losing the user's multi-project context.
-fn session_dashboard(state_dir: &PathBuf) -> Result<()> {
+fn session_dashboard(state_dir: &Path) -> Result<()> {
     load_theme(state_dir);
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -532,7 +664,7 @@ fn session_dashboard(state_dir: &PathBuf) -> Result<()> {
         EnableBracketedPaste
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let notification_listener = NotificationListener::start(state_dir.clone());
+    let notification_listener = NotificationListener::start(state_dir.to_path_buf());
     let mut install_update = false;
     let result = (|| -> Result<()> {
         while let Some(choice) = pick_workspace(&mut terminal, state_dir)? {
@@ -594,7 +726,7 @@ enum SessionChoice {
 
 fn pick_workspace(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state_dir: &PathBuf,
+    state_dir: &Path,
 ) -> Result<Option<SessionChoice>> {
     let response = dashboard_request(state_dir, Request::ListWorkspaces)?;
     let mut workspaces = response
@@ -610,8 +742,14 @@ fn pick_workspace(
     let mut hint = workspace_hint(available_update.as_deref());
     let mut removing = false;
     let mut settings_open = false;
+    let mut theme_picker_open = false;
     let mut update_confirmation = false;
     let mut selected_setting = 0_usize;
+    let mut selected_theme = THEMES
+        .iter()
+        .position(|theme| theme.name == active_theme().name)
+        .unwrap_or(0);
+    let mut theme_before_preview = active_theme();
     let preferences = Preferences::load(state_dir)?;
     let mut sound_enabled = preferences.notifications.sound;
     let mut automatic_update_checks = preferences.updates.automatic_checks;
@@ -626,6 +764,7 @@ fn pick_workspace(
         }
         available_update = refreshed_update;
         terminal.draw(|frame| {
+            frame.render_widget(Block::default().style(chrome_style()), frame.area());
             let masthead_height = workspace_masthead_height(frame.area().width);
             let areas = Layout::default()
                 .direction(Direction::Vertical)
@@ -706,7 +845,7 @@ fn pick_workspace(
                     .and_then(|value| value.to_str())
                     .unwrap_or(root);
                 let panes = workspace_pane_count(&workspaces[selected]);
-                frame.render_widget(WidgetClear, dialog);
+                clear_chrome(frame, dialog);
                 frame.render_widget(
                     Block::default()
                         .borders(Borders::ALL)
@@ -771,38 +910,53 @@ fn pick_workspace(
                 );
             }
             if settings_open {
-                let dialog = centered_fixed(54, 10, frame.area());
+                let dialog = centered_fixed(58, 12, frame.area());
                 let selected_style = Style::default()
-                    .fg(accent())
+                    .fg(selection_foreground())
                     .bg(focus_background())
                     .add_modifier(Modifier::BOLD);
-                let normal_style = Style::default().fg(Color::White);
-                let sound = format!(
-                    "{} Sound notifications       {}",
-                    if selected_setting == 0 { "›" } else { " " },
-                    if sound_enabled { "ON" } else { "OFF" }
+                let normal_style = chrome_style();
+                let row_width = usize::from(dialog.width.saturating_sub(2));
+                let sound = setting_row(
+                    "Sound notifications",
+                    if sound_enabled { "ON" } else { "OFF" },
+                    selected_setting == 0,
+                    row_width,
                 );
-                let theme = format!(
-                    "{} Theme                 {}",
-                    if selected_setting == 1 { "›" } else { " " },
-                    active_theme().name.to_ascii_uppercase()
+                let theme = setting_row(
+                    "Theme",
+                    &theme_label(active_theme().name),
+                    selected_setting == 1,
+                    row_width,
                 );
-                let updates = format!(
-                    "{} Available update         {}",
-                    if selected_setting == 3 { "›" } else { " " },
-                    available_update
-                        .as_deref()
-                        .map(|version| format!("v{version}"))
-                        .unwrap_or_else(|| "CURRENT".to_owned())
+                let update_value = available_update
+                    .as_deref()
+                    .map(|version| format!("v{version}"))
+                    .unwrap_or_else(|| "CURRENT".to_owned());
+                let updates = setting_row(
+                    "Available update",
+                    &update_value,
+                    selected_setting == 3,
+                    row_width,
                 );
-                let update_checks = format!(
-                    "{} Automatic update checks  {}",
-                    if selected_setting == 2 { "›" } else { " " },
-                    if automatic_update_checks { "ON" } else { "OFF" }
+                let update_checks = setting_row(
+                    "Automatic update checks",
+                    if automatic_update_checks { "ON" } else { "OFF" },
+                    selected_setting == 2,
+                    row_width,
                 );
-                frame.render_widget(WidgetClear, dialog);
+                clear_chrome(frame, dialog);
                 frame.render_widget(
                     Paragraph::new(vec![
+                        Line::styled(
+                            if dialog.width >= 54 {
+                                " ↑↓ Navigate · Enter/Space change · Esc back"
+                            } else {
+                                " ↑↓ Select · Enter change · Esc back"
+                            },
+                            Style::default().fg(muted()),
+                        ),
+                        Line::raw(""),
                         Line::styled(
                             sound,
                             if selected_setting == 0 {
@@ -836,10 +990,15 @@ fn pick_workspace(
                             },
                         ),
                         Line::raw(""),
-                        Line::styled("  Esc · back", Style::default().fg(muted())),
+                        Line::styled(
+                            " Tap any row to change its setting",
+                            Style::default().fg(muted()),
+                        ),
                     ])
+                    .style(chrome_style())
                     .block(
                         Block::default()
+                            .style(chrome_style())
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(border()))
                             .title(" BASTION · SETTINGS "),
@@ -847,10 +1006,56 @@ fn pick_workspace(
                     dialog,
                 );
             }
+            if theme_picker_open {
+                let dialog = theme_picker_rect(frame.area());
+                let (offset, visible) = theme_picker_viewport(selected_theme, THEMES.len(), dialog);
+                let mut lines = vec![
+                    Line::styled(
+                        " ↑↓ Preview · Enter apply · Esc cancel",
+                        Style::default().fg(muted()),
+                    ),
+                    Line::raw(""),
+                ];
+                lines.extend(THEMES.iter().enumerate().skip(offset).take(visible).map(
+                    |(index, theme)| {
+                        let marker = if index == selected_theme { "›" } else { " " };
+                        Line::styled(
+                            format!(" {marker} {}", theme_label(theme.name)),
+                            if index == selected_theme {
+                                Style::default()
+                                    .fg(selection_foreground())
+                                    .bg(focus_background())
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                chrome_style()
+                            },
+                        )
+                    },
+                ));
+                lines.push(Line::from(vec![
+                    Span::styled(" CANCEL", Style::default().fg(muted())),
+                    Span::raw("                     "),
+                    Span::styled(
+                        "APPLY ",
+                        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                clear_chrome(frame, dialog);
+                frame.render_widget(
+                    Paragraph::new(lines).style(chrome_style()).block(
+                        Block::default()
+                            .style(chrome_style())
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(accent()))
+                            .title(" SELECT THEME "),
+                    ),
+                    dialog,
+                );
+            }
             if update_confirmation {
                 let dialog = centered_fixed(58, 11, frame.area());
                 let version = available_update.as_deref().unwrap_or("new release");
-                frame.render_widget(WidgetClear, dialog);
+                clear_chrome(frame, dialog);
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::from(Span::styled(
@@ -899,6 +1104,30 @@ fn pick_workspace(
                     break Ok(Some(SessionChoice::InstallUpdate));
                 }
                 _ if update_confirmation => {}
+                KeyCode::Esc | KeyCode::Char('q') if theme_picker_open => {
+                    set_theme(theme_before_preview);
+                    theme_picker_open = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') if theme_picker_open => {
+                    selected_theme = selected_theme.saturating_sub(1);
+                    set_theme(THEMES[selected_theme]);
+                }
+                KeyCode::Down | KeyCode::Char('j') if theme_picker_open => {
+                    selected_theme = (selected_theme + 1).min(THEMES.len() - 1);
+                    set_theme(THEMES[selected_theme]);
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') if theme_picker_open => {
+                    let theme = THEMES[selected_theme];
+                    match save_theme(state_dir, theme) {
+                        Ok(()) => hint = format!(" Theme: {} ", theme.name),
+                        Err(error) => {
+                            set_theme(theme_before_preview);
+                            hint = format!(" Theme failed: {error:#} ");
+                        }
+                    }
+                    theme_picker_open = false;
+                }
+                _ if theme_picker_open => {}
                 KeyCode::Esc if settings_open => settings_open = false,
                 KeyCode::Char('q') if settings_open => settings_open = false,
                 KeyCode::Up | KeyCode::Char('k') if settings_open => {
@@ -922,10 +1151,12 @@ fn pick_workspace(
                             Err(error) => hint = format!(" Sound setting failed: {error:#} "),
                         }
                     } else if selected_setting == 1 {
-                        hint = match cycle_theme(state_dir) {
-                            Ok(name) => format!(" Theme: {name} "),
-                            Err(error) => format!(" Theme failed: {error:#} "),
-                        };
+                        theme_before_preview = active_theme();
+                        selected_theme = THEMES
+                            .iter()
+                            .position(|theme| theme.name == theme_before_preview.name)
+                            .unwrap_or(0);
+                        theme_picker_open = true;
                     } else if selected_setting == 2 {
                         automatic_update_checks = !automatic_update_checks;
                         match set_update_check_preference(state_dir, automatic_update_checks) {
@@ -1057,24 +1288,59 @@ fn pick_workspace(
             }
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && theme_picker_open =>
+            {
+                let size = terminal.size()?;
+                let dialog = theme_picker_rect(Rect::new(0, 0, size.width, size.height));
+                let (offset, visible) = theme_picker_viewport(selected_theme, THEMES.len(), dialog);
+                let entry_start = dialog.y.saturating_add(3);
+                let footer = dialog.bottom().saturating_sub(2);
+                if !contains(dialog, mouse.column, mouse.row) {
+                    set_theme(theme_before_preview);
+                    theme_picker_open = false;
+                } else if mouse.row >= entry_start
+                    && mouse.row < entry_start.saturating_add(visible as u16)
+                {
+                    selected_theme = offset + usize::from(mouse.row - entry_start);
+                    set_theme(THEMES[selected_theme]);
+                } else if mouse.row == footer {
+                    if mouse.column < dialog.x.saturating_add(dialog.width / 2) {
+                        set_theme(theme_before_preview);
+                    } else {
+                        let theme = THEMES[selected_theme];
+                        if let Err(error) = save_theme(state_dir, theme) {
+                            set_theme(theme_before_preview);
+                            hint = format!(" Theme failed: {error:#} ");
+                        } else {
+                            hint = format!(" Theme: {} ", theme.name);
+                        }
+                    }
+                    theme_picker_open = false;
+                }
+            }
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && settings_open =>
             {
                 let size = terminal.size()?;
-                let dialog = centered_fixed(54, 10, Rect::new(0, 0, size.width, size.height));
+                let dialog = centered_fixed(58, 12, Rect::new(0, 0, size.width, size.height));
                 if !contains(dialog, mouse.column, mouse.row) {
                     settings_open = false;
-                } else if mouse.row == dialog.y.saturating_add(1) {
+                } else if mouse.row == dialog.y.saturating_add(3) {
                     selected_setting = 0;
                     sound_enabled = !sound_enabled;
                     if let Err(error) = set_sound_preference(state_dir, sound_enabled) {
                         hint = format!(" Sound setting failed: {error:#} ");
                     }
-                } else if mouse.row == dialog.y.saturating_add(2) {
+                } else if mouse.row == dialog.y.saturating_add(4) {
                     selected_setting = 1;
-                    if let Err(error) = cycle_theme(state_dir) {
-                        hint = format!(" Theme failed: {error:#} ");
-                    }
-                } else if mouse.row == dialog.y.saturating_add(3) {
+                    theme_before_preview = active_theme();
+                    selected_theme = THEMES
+                        .iter()
+                        .position(|theme| theme.name == theme_before_preview.name)
+                        .unwrap_or(0);
+                    theme_picker_open = true;
+                } else if mouse.row == dialog.y.saturating_add(5) {
                     selected_setting = 2;
                     automatic_update_checks = !automatic_update_checks;
                     if let Err(error) =
@@ -1082,7 +1348,7 @@ fn pick_workspace(
                     {
                         hint = format!(" Update setting failed: {error:#} ");
                     }
-                } else if mouse.row == dialog.y.saturating_add(4) {
+                } else if mouse.row == dialog.y.saturating_add(6) {
                     selected_setting = 3;
                     if available_update.is_some() {
                         settings_open = false;
@@ -1090,7 +1356,7 @@ fn pick_workspace(
                     } else {
                         hint = " Bastion is up to date ".to_owned();
                     }
-                } else if mouse.row >= dialog.y.saturating_add(6) {
+                } else if mouse.row >= dialog.y.saturating_add(8) {
                     settings_open = false;
                 }
             }
@@ -1641,6 +1907,7 @@ fn render_pane_rail(
         .unwrap_or("workspace");
     frame.render_widget(
         Block::default()
+            .style(chrome_style())
             .borders(Borders::LEFT)
             .border_style(Style::default().fg(border())),
         area,
@@ -1676,15 +1943,15 @@ fn render_pane_rail(
             ),
             if selected {
                 Style::default()
-                    .fg(accent())
+                    .fg(selection_foreground())
                     .bg(focus_background())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(foreground())
             },
         )));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).style(chrome_style()), inner);
 }
 
 fn pane_overlay_rect(area: Rect, overlay: &PaneOverlay, roster_len: usize) -> Rect {
@@ -1706,7 +1973,7 @@ fn render_pane_overlay(
     roster: &[PaneDescriptor],
 ) {
     let popup = pane_overlay_rect(area, overlay, roster.len());
-    frame.render_widget(WidgetClear, popup);
+    clear_chrome(frame, popup);
     let lines = match overlay {
         PaneOverlay::Menu { selected } => {
             let labels = [
@@ -1799,19 +2066,23 @@ fn render_pane_overlay(
         ],
     };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(accent()))
-                .title(" PANE "),
-        ),
+        Paragraph::new(lines)
+            .style(chrome_style())
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .style(chrome_style())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(accent()))
+                    .title(" PANE "),
+            ),
         popup,
     );
 }
 
 fn render_offline_pane(frame: &mut ratatui::Frame, area: Rect, active: &PaneDescriptor) {
     let popup = offline_pane_rect(area);
-    frame.render_widget(WidgetClear, popup);
+    clear_chrome(frame, popup);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -1830,9 +2101,11 @@ fn render_offline_pane(frame: &mut ratatui::Frame, area: Rect, active: &PaneDesc
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             )),
         ])
+        .style(chrome_style())
         .alignment(ratatui::layout::Alignment::Center)
         .block(
             Block::default()
+                .style(chrome_style())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(error()))
                 .title(" PANE "),
@@ -1966,7 +2239,7 @@ fn embedded_pane(
                 // The retained-frame renderer only repaints changed terminal
                 // rows. Clear Bastion's chrome explicitly so shorter status
                 // labels never leave characters from the previous state.
-                frame.render_widget(WidgetClear, layout.header);
+                clear_chrome(frame, layout.header);
                 frame.render_widget(
                     Paragraph::new("‹ WORKSPACE")
                         .style(Style::default().fg(muted()))
@@ -2618,7 +2891,7 @@ struct DashboardInput {
 
 fn window_dashboard_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     workspace: &PathBuf,
     remembered_tab: &mut usize,
     notice: &mut String,
@@ -3120,6 +3393,11 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+fn clear_chrome(frame: &mut ratatui::Frame, area: Rect) {
+    frame.render_widget(WidgetClear, area);
+    frame.render_widget(Block::default().style(chrome_style()), area);
+}
+
 fn new_dashboard_input(action: DashboardAction) -> DashboardInput {
     DashboardInput {
         action,
@@ -3192,11 +3470,11 @@ fn popup_menu_line(label: &str, selected: bool, width: u16) -> Line<'static> {
         text,
         if selected {
             Style::default()
-                .fg(accent())
+                .fg(selection_foreground())
                 .bg(focus_background())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(foreground())
         },
     ))
 }
@@ -3605,6 +3883,7 @@ struct DashboardView<'a> {
 }
 
 fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: DashboardView<'_>) {
+    frame.render_widget(Block::default().style(chrome_style()), area);
     let DashboardView {
         tabs,
         selected_tab,
@@ -3879,7 +4158,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
                 .style(if index == 0 {
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD)
                 } else if enabled {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(foreground())
                 } else {
                     Style::default().fg(muted())
                 })
@@ -3906,7 +4185,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
         } else {
             centered_fixed(44, 7, area)
         };
-        frame.render_widget(WidgetClear, popup);
+        clear_chrome(frame, popup);
         frame.render_widget(
             Paragraph::new(format!("{}\n\n{}", action_label(input.action), input.value))
                 .block(
@@ -3922,7 +4201,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
         let menu = resume_menu_rect(area, resumable_slots.len());
         let (slot_offset, visible_slots) =
             resume_menu_viewport(selected_resume, resumable_slots.len(), menu);
-        frame.render_widget(WidgetClear, menu);
+        clear_chrome(frame, menu);
         let entries = resumable_slots
             .iter()
             .enumerate()
@@ -3947,7 +4226,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
                     if index == selected_resume {
                         Style::default().fg(accent()).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(foreground())
                     },
                 ))
             })
@@ -3994,7 +4273,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Tab");
         let menu = tab_menu_rect(area);
-        frame.render_widget(WidgetClear, menu);
+        clear_chrome(frame, menu);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -4025,7 +4304,7 @@ fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: Dashboard
             .and_then(serde_json::Value::as_str)
             .unwrap_or("No pane selected");
         let menu = pane_menu_rect(area);
-        frame.render_widget(WidgetClear, menu);
+        clear_chrome(frame, menu);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -4147,7 +4426,7 @@ fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
                 ),
             );
             frame.render_widget(
-                Paragraph::new(Line::styled(copy, Style::default().fg(Color::White))),
+                Paragraph::new(Line::styled(copy, Style::default().fg(foreground()))),
                 Rect::new(
                     copy_x,
                     area.y.saturating_add(4 + offset as u16),
@@ -4178,7 +4457,7 @@ fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             ">_ CODE · BUILD · DEPLOY",
-            Style::default().fg(Color::White),
+            Style::default().fg(foreground()),
         ))
         .alignment(ratatui::layout::Alignment::Center),
         Rect::new(text_x, area.y.saturating_add(8), text_width, 1),
@@ -4187,7 +4466,7 @@ fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
     let copy_height = if wrapped { 2 } else { 1 };
     frame.render_widget(
         Paragraph::new(MASTHEAD_DESCRIPTION)
-            .style(Style::default().fg(Color::White))
+            .style(Style::default().fg(foreground()))
             .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true }),
         Rect::new(text_x, area.y.saturating_add(9), text_width, copy_height),
@@ -4196,7 +4475,7 @@ fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(MASTHEAD_PROMISE)
             .style(
                 Style::default()
-                    .fg(Color::White)
+                    .fg(foreground())
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(ratatui::layout::Alignment::Center)
@@ -4220,6 +4499,45 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     )
+}
+
+fn theme_label(name: &str) -> String {
+    name.split('-')
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                format!("{}{}", first.to_uppercase(), characters.as_str())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn setting_row(label: &str, value: &str, selected: bool, width: usize) -> String {
+    let marker = if selected { "›" } else { " " };
+    let reserved = marker.chars().count() + value.chars().count() + 2;
+    let label = truncate_display_label(label, width.saturating_sub(reserved));
+    let spacing = " ".repeat(width.saturating_sub(
+        marker.chars().count() + 1 + label.chars().count() + value.chars().count(),
+    ));
+    format!("{marker} {label}{spacing}{value}")
+}
+
+fn theme_picker_rect(area: Rect) -> Rect {
+    let desired_height = (THEMES.len() as u16).saturating_add(5).min(19);
+    centered_fixed(48, desired_height, area)
+}
+
+fn theme_picker_viewport(selected: usize, theme_count: usize, dialog: Rect) -> (usize, usize) {
+    let visible = usize::from(dialog.height.saturating_sub(5)).min(theme_count);
+    if visible == 0 {
+        return (0, 0);
+    }
+    let offset = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(theme_count.saturating_sub(visible));
+    (offset, visible)
 }
 
 fn workspace_removal_rect(area: Rect) -> Rect {
@@ -4633,6 +4951,68 @@ mod tests {
         assert_eq!(scrolled_pane_selection(0, 3, false), 1);
         assert_eq!(scrolled_pane_selection(2, 3, false), 2);
         assert_eq!(scrolled_pane_selection(0, 0, false), 0);
+    }
+
+    #[test]
+    fn public_theme_catalog_is_unique_and_keeps_agent_terminal_defaults() {
+        let names = THEMES
+            .iter()
+            .map(|theme| theme.name)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), THEMES.len());
+        for expected in [
+            "tokyo-night",
+            "catppuccin-mocha",
+            "gruvbox-dark",
+            "solarized-dark",
+            "solarized-light",
+            "dracula",
+            "nord",
+        ] {
+            assert!(names.contains(expected));
+        }
+        let light = THEMES
+            .iter()
+            .find(|theme| theme.name == "solarized-light")
+            .unwrap();
+        assert_eq!(light.background, Color::Rgb(253, 246, 227));
+        assert_eq!(light.foreground, Color::Rgb(88, 110, 117));
+        assert_eq!(
+            terminal_color(&workspace_terminal::CellColor::DefaultForeground),
+            Color::White
+        );
+        assert_eq!(
+            terminal_color(&workspace_terminal::CellColor::DefaultBackground),
+            Color::Black
+        );
+    }
+
+    #[test]
+    fn theme_picker_scrolls_without_outgrowing_portrait() {
+        let portrait = Rect::new(0, 0, 44, 18);
+        let dialog = theme_picker_rect(portrait);
+        assert!(dialog.width <= portrait.width);
+        assert!(dialog.height <= portrait.height);
+        let visible = usize::from(dialog.height.saturating_sub(5));
+        assert!(visible < THEMES.len());
+        assert_eq!(theme_picker_viewport(0, THEMES.len(), dialog), (0, visible));
+        assert_eq!(
+            theme_picker_viewport(THEMES.len() - 1, THEMES.len(), dialog),
+            (THEMES.len() - visible, visible)
+        );
+        assert_eq!(theme_label("catppuccin-mocha"), "Catppuccin Mocha");
+        assert_eq!(
+            setting_row("Automatic update checks", "ON", true, 38)
+                .chars()
+                .count(),
+            38
+        );
+        assert_eq!(
+            setting_row("Theme", "Catppuccin Mocha", false, 38)
+                .chars()
+                .count(),
+            38
+        );
     }
 
     #[test]
