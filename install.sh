@@ -143,7 +143,7 @@ collect_missing_dependencies() {
 
 install_dependencies() {
     collect_missing_dependencies
-    [ -n "$missing_packages" ] || return
+    [ -n "$missing_packages" ] || return 0
 
     say ""
     say "Bastion needs these Termux packages: $missing_packages"
