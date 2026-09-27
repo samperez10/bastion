@@ -14,6 +14,36 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 > [!IMPORTANT]
 > Bastion is alpha software. The first releases target ARM64 Android devices running Termux; support for Linux and other terminal platforms may be added later.
 
+## Sneak peek
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/workspace-selector-portrait.jpg" alt="Bastion workspace selector in portrait mode"><br>
+      <sub>Workspace selector</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/workspace-dashboard-portrait.jpg" alt="Bastion workspace dashboard in portrait mode"><br>
+      <sub>Tabs and managed panes</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/claude-pane-portrait.jpg" alt="Claude Code running inside a Bastion pane in portrait mode"><br>
+      <sub>Claude Code inside Bastion</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/settings-portrait.jpg" alt="Bastion settings and theme controls"><br>
+      <sub>Settings and live theme controls</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="assets/screenshots/claude-pane-landscape.jpg" alt="Bastion landscape pane view with the workspace rail"><br>
+  <sub>Responsive landscape view with workspace and pane navigation</sub>
+</p>
+
 ## Requirements
 
 - Termux on an ARM64 Android device; the initial release target is Android API 26 or newer.
