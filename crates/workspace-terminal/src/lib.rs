@@ -174,6 +174,10 @@ impl Terminal {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let content = self.term.renderable_content();
         let cursor = if content.display_offset == 0 {
@@ -385,8 +389,10 @@ mod tests {
         let mut terminal = Terminal::new(2, 8);
         terminal.process(b"one\r\ntwo\r\nthree");
         assert!(terminal.scroll_viewport(1));
+        assert_eq!(terminal.display_offset(), 1);
         assert!(terminal.snapshot().output.contains("one"));
         terminal.scroll_viewport_to_bottom();
+        assert_eq!(terminal.display_offset(), 0);
         assert!(terminal.snapshot().output.contains("three"));
     }
 

@@ -61,6 +61,9 @@ enum Response {
     TabCreated {
         tab: workspace_core::WorkspaceTab,
     },
+    Updated {
+        message: String,
+    },
     Deleted {
         message: String,
     },
@@ -609,23 +612,51 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                 .ensure_tab(&project, &name)?;
             write_response(&mut stream, Response::TabCreated { tab })
         }
+        Request::RenameTab {
+            name,
+            new_name,
+            cwd,
+        } => {
+            let cwd = cwd.unwrap_or_else(|| daemon.default_cwd.clone());
+            let project = daemon.database.lock().unwrap().ensure_project(&cwd)?;
+            daemon
+                .database
+                .lock()
+                .unwrap()
+                .rename_tab(&project, &name, &new_name)?;
+            let renamed = new_name.trim().to_owned();
+            for pane in daemon.panes.lock().unwrap().values() {
+                if pane.project.id == project.id && *pane.tab.lock().unwrap() == name {
+                    *pane.tab.lock().unwrap() = renamed.clone();
+                }
+            }
+            write_response(
+                &mut stream,
+                Response::Updated {
+                    message: format!("tab renamed to {renamed}"),
+                },
+            )
+        }
         Request::DeleteTab { name, cwd } => {
-            if daemon
+            let cwd = cwd.unwrap_or_else(|| daemon.default_cwd.clone());
+            let project = daemon.database.lock().unwrap().ensure_project(&cwd)?;
+            let active_count = daemon
                 .panes
                 .lock()
                 .unwrap()
                 .values()
-                .any(|pane| *pane.tab.lock().unwrap() == name)
-            {
+                .filter(|pane| pane.project.id == project.id && *pane.tab.lock().unwrap() == name)
+                .count();
+            if active_count > 0 {
                 return write_response(
                     &mut stream,
                     Response::Error {
-                        message: format!("tab {name} still has active panes"),
+                        message: format!(
+                            "tab {name} has {active_count} active pane(s); close them before deleting it"
+                        ),
                     },
                 );
             }
-            let cwd = cwd.unwrap_or_else(|| daemon.default_cwd.clone());
-            let project = daemon.database.lock().unwrap().ensure_project(&cwd)?;
             daemon
                 .database
                 .lock()

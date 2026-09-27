@@ -2,7 +2,7 @@
 
 **A persistent command center for AI coding agents in Termux.**
 
-Bastion is a Termux-native workspace and session manager for terminal-based AI coding agents on Android. It organizes projects, tabs, and real PTY panes in a touch-friendly interface designed for portrait phone screens.
+Bastion is a Termux-native workspace and session manager for terminal-based AI coding agents on Android. It organizes projects, tabs, and real PTY panes in a touch-friendly interface with responsive portrait and landscape layouts.
 
 - **Persistent panes** — shells and agents continue running in a local background daemon after the interface detaches.
 - **Native session resume and lifecycle state** — project-scoped adapters preserve supported Claude, Codex, and Antigravity sessions and report working, attention, and completion states when the agent exposes the required hooks.

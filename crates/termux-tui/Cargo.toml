@@ -12,6 +12,7 @@ ratatui.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
 bastion-audio = { path = "../bastion-audio" }
 workspace-protocol = { path = "../workspace-protocol" }
 workspace-core = { path = "../workspace-core" }

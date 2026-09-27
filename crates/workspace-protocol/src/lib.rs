@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const PROTOCOL_VERSION: u16 = 1;
 /// Increment when a running daemon must be replaced to use a release's
 /// server-side behavior. Clients use it for safe stale-daemon detection.
-pub const DAEMON_REVISION: u32 = 7;
+pub const DAEMON_REVISION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +91,11 @@ pub enum Request {
     },
     CreateTab {
         name: String,
+        cwd: Option<PathBuf>,
+    },
+    RenameTab {
+        name: String,
+        new_name: String,
         cwd: Option<PathBuf>,
     },
     DeleteTab {

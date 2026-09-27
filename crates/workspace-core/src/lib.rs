@@ -395,8 +395,13 @@ impl StateDb {
     }
 
     pub fn delete_tab(&self, project: &Project, name: &str) -> Result<()> {
-        if name == "Main" {
-            anyhow::bail!("the Main tab cannot be deleted");
+        let tab_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM workspace_tabs WHERE project_id = ?1",
+            [project.id],
+            |row| row.get(0),
+        )?;
+        if tab_count <= 1 {
+            anyhow::bail!("a workspace must keep at least one tab");
         }
         let changed = self.connection.execute(
             "DELETE FROM workspace_tabs WHERE project_id = ?1 AND name = ?2",
@@ -405,6 +410,44 @@ impl StateDb {
         if changed == 0 {
             anyhow::bail!("tab not found: {name}");
         }
+        Ok(())
+    }
+
+    pub fn rename_tab(&self, project: &Project, name: &str, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            anyhow::bail!("tab name cannot be empty");
+        }
+        if name == new_name {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM workspace_tabs WHERE project_id = ?1 AND name = ?2",
+            params![project.id, name],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            anyhow::bail!("tab not found: {name}");
+        }
+        let duplicate: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM workspace_tabs WHERE project_id = ?1 AND name = ?2",
+            params![project.id, new_name],
+            |row| row.get(0),
+        )?;
+        if duplicate > 0 {
+            anyhow::bail!("tab already exists: {new_name}");
+        }
+        transaction.execute(
+            "UPDATE workspace_tabs SET name = ?1 WHERE project_id = ?2 AND name = ?3",
+            params![new_name, project.id, name],
+        )?;
+        transaction.execute(
+            "UPDATE agent_slots SET last_tab = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE project_id = ?2 AND last_tab = ?3",
+            params![new_name, project.id, name],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1229,6 +1272,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not belong"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_tab_preserves_its_panes_and_saved_sessions() {
+        let root = test_root("rename-tab");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let database = StateDb::open(&state_dir).unwrap();
+        let project = database.ensure_project(&project_root).unwrap();
+        let tab = database.ensure_tab(&project, "Research").unwrap();
+        database
+            .record_pane("pane-research", project.id, tab.id, "Pane 1", "sh -i")
+            .unwrap();
+        database
+            .record_agent_session(&project, "claude", "research", "session-id")
+            .unwrap();
+        database
+            .set_slot_tab(&project, "claude", "research", "Research")
+            .unwrap();
+
+        database.rename_tab(&project, "Research", "Notes").unwrap();
+
+        let tabs = database.list_tabs(&project).unwrap();
+        assert!(
+            tabs.iter()
+                .any(|item| item.id == tab.id && item.name == "Notes")
+        );
+        assert!(!tabs.iter().any(|item| item.name == "Research"));
+        assert_eq!(
+            database
+                .slot(&project, "claude", "research")
+                .unwrap()
+                .unwrap()
+                .last_tab
+                .as_deref(),
+            Some("Notes")
+        );
+        assert!(database.rename_tab(&project, "Notes", "Main").is_err());
+        assert!(database.rename_tab(&project, "Notes", "  ").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_tabs_keeps_at_least_one_tab() {
+        let root = test_root("last-tab");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let database = StateDb::open(&state_dir).unwrap();
+        let project = database.ensure_project(&project_root).unwrap();
+
+        assert!(database.delete_tab(&project, "Main").is_err());
+        database.ensure_tab(&project, "Second").unwrap();
+        database.delete_tab(&project, "Main").unwrap();
+        assert_eq!(database.list_tabs(&project).unwrap().len(), 1);
+        assert!(database.delete_tab(&project, "Second").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

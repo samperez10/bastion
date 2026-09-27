@@ -349,6 +349,7 @@ fn copy_pty_output(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<Vec
 }
 
 #[cfg(not(feature = "alacritty"))]
+#[allow(clippy::too_many_arguments)] // Keep parity with the feature-backed probe entry point.
 fn pty(
     _: u64,
     _: u16,

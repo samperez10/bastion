@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll, read,
+        Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll,
+        read,
     },
     execute,
     terminal::{
@@ -22,10 +23,11 @@ use ratatui::{
 use semver::Version;
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     os::unix::net::UnixStream,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::mpsc,
     sync::{
@@ -36,6 +38,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use workspace_core::Preferences;
 use workspace_protocol::Request;
 use workspace_terminal::MouseProtocol;
@@ -447,7 +450,7 @@ fn dashboard_in_session(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let mut remembered_tab = 0_usize;
     let mut notice = String::new();
-    let result = loop {
+    loop {
         let exit = match catch_unwind(AssertUnwindSafe(|| {
             window_dashboard_loop(
                 terminal,
@@ -471,24 +474,13 @@ fn dashboard_in_session(
         };
         match exit {
             DashboardExit::Quit => break Ok(()),
-            DashboardExit::Attach {
-                pane_id,
-                label,
-                preview,
-            } => {
-                let mut active_id = pane_id;
-                let mut active_label = label;
-                let mut preview = preview;
-                notification_listener.set_active(Some(active_id.clone()));
+            DashboardExit::Attach { pane, roster } => {
+                let mut active = pane;
+                let mut roster = roster;
+                notification_listener.set_active(Some(active.pane_id.clone()));
                 loop {
                     match catch_unwind(AssertUnwindSafe(|| {
-                        embedded_pane(
-                            terminal,
-                            state_dir,
-                            &active_id,
-                            &active_label,
-                            preview.as_ref(),
-                        )
+                        embedded_pane(terminal, state_dir, &active, &roster)
                     })) {
                         Err(_) => {
                             notice = "pane renderer recovered; returned to workspace".to_owned();
@@ -504,26 +496,27 @@ fn dashboard_in_session(
                         // recalculates the viewport and makes the daemon
                         // resize the PTY before a fresh grid is drawn.
                         Ok(Ok(EmbeddedPaneExit::Reattach)) => continue,
-                        Ok(Ok(EmbeddedPaneExit::Focus(next_id))) => {
-                            let old = PanePreview {
-                                pane_id: active_id,
-                                label: active_label,
-                            };
-                            active_label = preview
-                                .as_ref()
-                                .map(|pane| pane.label.clone())
-                                .unwrap_or_else(|| "Active pane".to_owned());
-                            active_id = next_id;
-                            notification_listener.set_active(Some(active_id.clone()));
-                            preview = Some(old);
+                        Ok(Ok(EmbeddedPaneExit::Focus {
+                            pane_id,
+                            roster: refreshed,
+                        })) => {
+                            roster = refreshed;
+                            if let Some(next) =
+                                roster.iter().find(|pane| pane.pane_id == pane_id).cloned()
+                            {
+                                active = next;
+                                notification_listener.set_active(Some(active.pane_id.clone()));
+                            } else {
+                                notice = "pane is no longer available".to_owned();
+                                break;
+                            }
                         }
                     }
                 }
                 notification_listener.set_active(None);
             }
         }
-    };
-    result
+    }
 }
 
 /// The outer Bastion session switcher. Closing a workspace dashboard returns
@@ -622,7 +615,7 @@ fn pick_workspace(
     let preferences = Preferences::load(state_dir)?;
     let mut sound_enabled = preferences.notifications.sound;
     let mut automatic_update_checks = preferences.updates.automatic_checks;
-    let result = loop {
+    loop {
         let refreshed_update = cached_update_version(state_dir);
         if refreshed_update != available_update
             && !settings_open
@@ -698,24 +691,83 @@ fn pick_workspace(
                 } else {
                     hint.as_str()
                 })
-                    .style(Style::default().fg(muted()))
-                    .block(Block::default().borders(Borders::TOP)),
+                .style(Style::default().fg(muted()))
+                .block(Block::default().borders(Borders::TOP)),
                 areas[2],
             );
             if removing {
-                let dialog = centered_rect(90, 55, frame.area());
-                let root = workspaces[selected].get("canonical_root").and_then(serde_json::Value::as_str).unwrap_or("?");
+                let dialog = workspace_removal_rect(frame.area());
+                let root = workspaces[selected]
+                    .get("canonical_root")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let name = std::path::Path::new(root)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(root);
                 let panes = workspace_pane_count(&workspaces[selected]);
                 frame.render_widget(WidgetClear, dialog);
                 frame.render_widget(
-                    Paragraph::new(format!(
-                        "Remove this Bastion workspace?\n  {root}\n\nBastion removes tabs, pane records, and saved sessions.\nYour project folder and files are untouched.\n\n{}\n\n  CANCEL                         {}",
-                        if panes == 0 { "No running panes." } else { "Running panes will be stopped." },
-                        if panes == 0 { "REMOVE" } else { "STOP & REMOVE" }
-                    ))
-                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(error())).title(" Remove workspace · Enter confirms · Esc cancels "))
-                    .wrap(Wrap { trim: true }),
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(error()))
+                        .title(" REMOVE WORKSPACE "),
                     dialog,
+                );
+                let inner = Rect::new(
+                    dialog.x.saturating_add(2),
+                    dialog.y.saturating_add(1),
+                    dialog.width.saturating_sub(4),
+                    dialog.height.saturating_sub(2),
+                );
+                frame.render_widget(
+                    Paragraph::new(name)
+                        .style(Style::default().fg(error()).add_modifier(Modifier::BOLD)),
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new(root)
+                        .style(Style::default().fg(muted()))
+                        .wrap(Wrap { trim: true }),
+                    Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 2),
+                );
+                frame.render_widget(
+                    Paragraph::new(if panes == 0 {
+                        "Removes Bastion tabs and saved sessions."
+                    } else {
+                        "Stops active panes and removes Bastion state."
+                    }),
+                    Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new("Project files remain untouched.")
+                        .style(Style::default().fg(muted())),
+                    Rect::new(inner.x, inner.y.saturating_add(5), inner.width, 1),
+                );
+                let buttons = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(Rect::new(
+                        dialog.x.saturating_add(1),
+                        dialog.bottom().saturating_sub(2),
+                        dialog.width.saturating_sub(2),
+                        1,
+                    ));
+                frame.render_widget(
+                    Paragraph::new("CANCEL")
+                        .style(Style::default().fg(muted()))
+                        .alignment(ratatui::layout::Alignment::Center),
+                    buttons[0],
+                );
+                frame.render_widget(
+                    Paragraph::new(if panes == 0 {
+                        "REMOVE"
+                    } else {
+                        "STOP & REMOVE"
+                    })
+                    .style(Style::default().fg(error()).add_modifier(Modifier::BOLD))
+                    .alignment(ratatui::layout::Alignment::Center),
+                    buttons[1],
                 );
             }
             if settings_open {
@@ -751,10 +803,38 @@ fn pick_workspace(
                 frame.render_widget(WidgetClear, dialog);
                 frame.render_widget(
                     Paragraph::new(vec![
-                        Line::styled(sound, if selected_setting == 0 { selected_style } else { normal_style }),
-                        Line::styled(theme, if selected_setting == 1 { selected_style } else { normal_style }),
-                        Line::styled(update_checks, if selected_setting == 2 { selected_style } else { normal_style }),
-                        Line::styled(updates, if selected_setting == 3 { selected_style } else { normal_style }),
+                        Line::styled(
+                            sound,
+                            if selected_setting == 0 {
+                                selected_style
+                            } else {
+                                normal_style
+                            },
+                        ),
+                        Line::styled(
+                            theme,
+                            if selected_setting == 1 {
+                                selected_style
+                            } else {
+                                normal_style
+                            },
+                        ),
+                        Line::styled(
+                            update_checks,
+                            if selected_setting == 2 {
+                                selected_style
+                            } else {
+                                normal_style
+                            },
+                        ),
+                        Line::styled(
+                            updates,
+                            if selected_setting == 3 {
+                                selected_style
+                            } else {
+                                normal_style
+                            },
+                        ),
                         Line::raw(""),
                         Line::styled("  Esc · back", Style::default().fg(muted())),
                     ])
@@ -787,7 +867,10 @@ fn pick_workspace(
                             Span::styled("X ", Style::default().fg(muted())),
                             Span::raw("Skip     "),
                             Span::styled("Enter ", Style::default().fg(accent())),
-                            Span::styled("Update now", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                "Update now",
+                                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                            ),
                         ]),
                     ])
                     .wrap(Wrap { trim: true })
@@ -917,8 +1000,9 @@ fn pick_workspace(
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && removing =>
             {
                 let size = terminal.size()?;
-                let dialog = centered_rect(90, 55, Rect::new(0, 0, size.width, size.height));
-                if contains(dialog, mouse.column, mouse.row) {
+                let dialog = workspace_removal_rect(Rect::new(0, 0, size.width, size.height));
+                let action_row = dialog.bottom().saturating_sub(2);
+                if contains(dialog, mouse.column, mouse.row) && mouse.row == action_row {
                     if mouse.column < dialog.x.saturating_add(dialog.width / 2) {
                         removing = false;
                     } else {
@@ -940,7 +1024,7 @@ fn pick_workspace(
                         }
                         removing = false;
                     }
-                } else {
+                } else if !contains(dialog, mouse.column, mouse.row) {
                     removing = false;
                 }
             }
@@ -1043,8 +1127,7 @@ fn pick_workspace(
             }
             _ => {}
         }
-    };
-    result
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -1135,7 +1218,7 @@ fn workspace_root_at(workspaces: &[serde_json::Value], selected: usize) -> Resul
     Ok(PathBuf::from(root))
 }
 
-fn listed_workspaces(state_dir: &PathBuf) -> Result<Vec<serde_json::Value>> {
+fn listed_workspaces(state_dir: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(dashboard_request(state_dir, Request::ListWorkspaces)?
         .get("workspaces")
         .and_then(serde_json::Value::as_array)
@@ -1143,7 +1226,7 @@ fn listed_workspaces(state_dir: &PathBuf) -> Result<Vec<serde_json::Value>> {
         .unwrap_or_default())
 }
 
-fn remove_workspace_request(state_dir: &PathBuf, cwd: PathBuf, force: bool) -> Result<()> {
+fn remove_workspace_request(state_dir: &Path, cwd: PathBuf, force: bool) -> Result<()> {
     let response = dashboard_request(state_dir, Request::RemoveWorkspace { cwd, force })?;
     if response.get("type").and_then(serde_json::Value::as_str) == Some("error") {
         anyhow::bail!(
@@ -1157,37 +1240,32 @@ fn remove_workspace_request(state_dir: &PathBuf, cwd: PathBuf, force: bool) -> R
     Ok(())
 }
 
-/// Android's terminal column count varies dramatically with the selected
-/// Termux font and display scale.  A 70–80 column phone is still portrait in
-/// practice, so use a wider threshold only when running under Termux.
-fn compact_layout(width: u16) -> bool {
-    width <= 55
-        || (std::env::var("PREFIX").is_ok_and(|prefix| prefix.contains("com.termux"))
-            && width <= 85)
-}
-
 enum DashboardExit {
     Quit,
     Attach {
-        pane_id: String,
-        label: String,
-        preview: Option<PanePreview>,
+        pane: PaneDescriptor,
+        roster: Vec<PaneDescriptor>,
     },
 }
 
-/// A preview deliberately reads bounded daemon history instead of opening a
-/// second PTY attachment. Two attachments resize the same PTY, which would
-/// disrupt an inactive agent's full-screen UI.
-#[derive(Clone)]
-struct PanePreview {
+#[derive(Clone, Debug)]
+struct PaneDescriptor {
     pane_id: String,
     label: String,
+    agent: String,
+    state: String,
+    tab: String,
+    workspace_root: String,
+    resume_command: Option<String>,
 }
 
 enum EmbeddedPaneExit {
     Workspace,
     Reattach,
-    Focus(String),
+    Focus {
+        pane_id: String,
+        roster: Vec<PaneDescriptor>,
+    },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1198,12 +1276,73 @@ struct PaneInputModes {
 
 enum PaneInputEvent {
     Reattach,
-    Mouse(MouseEvent),
+    Mouse(PaneMouseInput),
     Escape,
     Workspace,
     FocusPreview,
     ReturnToLiveBottom,
     Offline,
+    Key(KeyEvent),
+    Paste(String),
+}
+
+/// Keeps the low-latency input thread behind the UI thread while a touch is
+/// being routed. Without this acknowledgement, a key pressed immediately
+/// after opening a modal can be forwarded to the PTY before `chrome_active`
+/// is set by the UI loop.
+struct PaneMouseInput {
+    event: MouseEvent,
+    acknowledged: Option<mpsc::Sender<()>>,
+}
+
+impl std::ops::Deref for PaneMouseInput {
+    type Target = MouseEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+impl Drop for PaneMouseInput {
+    fn drop(&mut self) {
+        if let Some(acknowledged) = self.acknowledged.take() {
+            let _ = acknowledged.send(());
+        }
+    }
+}
+
+enum PaneOverlay {
+    Menu { selected: usize },
+    Switch { selected: usize },
+    Rename { value: String },
+    Status,
+    CloseConfirm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalNavigation {
+    Cancel,
+    Previous,
+    Next,
+    Confirm,
+    Ignore,
+}
+
+fn modal_navigation(code: &KeyCode) -> ModalNavigation {
+    match code {
+        KeyCode::Esc => ModalNavigation::Cancel,
+        KeyCode::Up => ModalNavigation::Previous,
+        KeyCode::Down => ModalNavigation::Next,
+        KeyCode::Enter => ModalNavigation::Confirm,
+        _ => ModalNavigation::Ignore,
+    }
+}
+
+fn is_unmodified_text_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.intersects(
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+        )
 }
 
 /// Reads Android keyboard events independently of painting the Ratatui grid.
@@ -1223,9 +1362,68 @@ impl Drop for PaneInputPump {
     }
 }
 
+struct PaneRosterPump {
+    stop: mpsc::Sender<()>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PaneRosterPump {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn start_pane_roster_pump(
+    state_dir: PathBuf,
+    workspace_root: String,
+    tab: String,
+) -> (PaneRosterPump, mpsc::Receiver<Vec<PaneDescriptor>>) {
+    let (stop, stop_rx) = mpsc::channel();
+    let (updates, update_rx) = mpsc::channel();
+    let join = thread::spawn(move || {
+        loop {
+            if let Ok(status) = dashboard_request(&state_dir, Request::Status) {
+                let mut values = status
+                    .get("pane_details")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|pane| {
+                        pane.get("workspace_root")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(workspace_root.as_str())
+                            && pane.get("tab").and_then(serde_json::Value::as_str)
+                                == Some(tab.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                values.sort_by_key(pane_order_key);
+                if updates.send(pane_roster(&values)).is_err() {
+                    break;
+                }
+            }
+            match stop_rx.recv_timeout(Duration::from_millis(900)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    });
+    (
+        PaneRosterPump {
+            stop,
+            join: Some(join),
+        },
+        update_rx,
+    )
+}
+
 fn start_pane_input_pump(
     writer: Arc<Mutex<UnixStream>>,
     modes: Arc<Mutex<PaneInputModes>>,
+    chrome_active: Arc<AtomicBool>,
 ) -> (PaneInputPump, mpsc::Receiver<PaneInputEvent>) {
     let (sender, receiver) = mpsc::channel();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -1240,18 +1438,42 @@ fn start_pane_input_pump(
             };
             let event_to_send = match event {
                 Event::Resize(_, _) => Some(PaneInputEvent::Reattach),
-                Event::Mouse(mouse) => Some(PaneInputEvent::Mouse(mouse)),
+                Event::Mouse(mouse) => {
+                    let (acknowledged_tx, acknowledged_rx) = mpsc::channel();
+                    if sender
+                        .send(PaneInputEvent::Mouse(PaneMouseInput {
+                            event: mouse,
+                            acknowledged: Some(acknowledged_tx),
+                        }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    while !stop_signal.load(Ordering::Acquire) {
+                        match acknowledged_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                    None
+                }
                 Event::Paste(text) => {
-                    let bracketed = modes.lock().unwrap().bracketed_paste;
-                    let bytes = bracketed_paste_bytes(&text, bracketed);
-                    if writer.lock().unwrap().write_all(&bytes).is_err() {
-                        Some(PaneInputEvent::Offline)
+                    if chrome_active.load(Ordering::Acquire) {
+                        Some(PaneInputEvent::Paste(text))
                     } else {
-                        Some(PaneInputEvent::ReturnToLiveBottom)
+                        let bracketed = modes.lock().unwrap().bracketed_paste;
+                        let bytes = bracketed_paste_bytes(&text, bracketed);
+                        if writer.lock().unwrap().write_all(&bytes).is_err() {
+                            Some(PaneInputEvent::Offline)
+                        } else {
+                            Some(PaneInputEvent::ReturnToLiveBottom)
+                        }
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if key
+                    if chrome_active.load(Ordering::Acquire) {
+                        Some(PaneInputEvent::Key(key))
+                    } else if key
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('b'))
@@ -1298,33 +1520,360 @@ fn start_pane_input_pump(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneLayout {
+    header: Rect,
+    terminal: Rect,
+    rail: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneHeaderAreas {
+    workspace: Rect,
+    status: Rect,
+    action: Rect,
+}
+
+fn pane_layout(area: Rect) -> PaneLayout {
+    let header = Rect::new(area.x, area.y, area.width, area.height.min(2));
+    let body = Rect::new(
+        area.x,
+        area.y.saturating_add(header.height),
+        area.width,
+        area.height.saturating_sub(header.height),
+    );
+    let show_rail = area.width >= 100 && area.width > area.height.saturating_mul(2);
+    if show_rail {
+        let rail_width = (area.width / 4).clamp(22, 30);
+        PaneLayout {
+            header,
+            terminal: Rect::new(
+                body.x,
+                body.y,
+                body.width.saturating_sub(rail_width),
+                body.height,
+            ),
+            rail: Rect::new(
+                body.right().saturating_sub(rail_width),
+                body.y,
+                rail_width,
+                body.height,
+            ),
+        }
+    } else {
+        PaneLayout {
+            header,
+            terminal: body,
+            rail: Rect::default(),
+        }
+    }
+}
+
+fn pane_header_areas(header: Rect) -> PaneHeaderAreas {
+    let action_width = 5_u16.min(header.width / 4);
+    let workspace = Rect::new(
+        header.x,
+        header.y,
+        header.width.saturating_sub(action_width),
+        header.height.min(1),
+    );
+    let action = Rect::new(
+        workspace.right(),
+        header.y,
+        action_width,
+        header.height.min(1),
+    );
+    let status = Rect::new(
+        header.x,
+        header.y.saturating_add(1),
+        header.width,
+        header.height.saturating_sub(1).min(1),
+    );
+    PaneHeaderAreas {
+        workspace,
+        status,
+        action,
+    }
+}
+
+fn pane_header_status(active: &PaneDescriptor, offline: bool, scrollback_offset: usize) -> String {
+    if offline {
+        format!("{} · OFFLINE", active.label)
+    } else if scrollback_offset > 0 {
+        format!("HISTORY · {scrollback_offset} lines up")
+    } else if active.state == "unknown" || active.state.is_empty() {
+        format!("{} · {}", active.label, active.agent)
+    } else {
+        format!("{} · {} · {}", active.label, active.agent, active.state)
+    }
+}
+
+fn invalidate_pane_frame(
+    retained_frame: &mut Option<Buffer>,
+    prior_screen: &mut Option<workspace_terminal::Snapshot>,
+) {
+    *retained_frame = None;
+    *prior_screen = None;
+}
+
+fn next_pane_id(roster: &[PaneDescriptor], active_id: &str) -> Option<String> {
+    if roster.len() < 2 {
+        return None;
+    }
+    let current = roster
+        .iter()
+        .position(|pane| pane.pane_id == active_id)
+        .unwrap_or(0);
+    roster
+        .get((current + 1) % roster.len())
+        .map(|pane| pane.pane_id.clone())
+}
+
+fn render_pane_rail(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    active: &PaneDescriptor,
+    roster: &[PaneDescriptor],
+) {
+    let project = std::path::Path::new(&active.workspace_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(border())),
+        area,
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(2),
+        area.y,
+        area.width.saturating_sub(3),
+        area.height,
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            truncate_display_label(project, usize::from(inner.width)),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            truncate_display_label(&active.tab, usize::from(inner.width)),
+            Style::default().fg(muted()),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled("PANES", Style::default().fg(muted()))),
+    ];
+    for pane in roster
+        .iter()
+        .take(usize::from(inner.height.saturating_sub(5)))
+    {
+        let selected = pane.pane_id == active.pane_id;
+        let marker = if selected { "›" } else { " " };
+        lines.push(Line::from(Span::styled(
+            truncate_display_label(
+                &format!("{marker} {} · {}", pane.label, pane.agent),
+                usize::from(inner.width),
+            ),
+            if selected {
+                Style::default()
+                    .fg(accent())
+                    .bg(focus_background())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn pane_overlay_rect(area: Rect, overlay: &PaneOverlay, roster_len: usize) -> Rect {
+    match overlay {
+        PaneOverlay::Menu { .. } => centered_fixed(44, 11, area),
+        PaneOverlay::Switch { .. } => {
+            centered_fixed(44, (roster_len as u16).saturating_add(4).min(14), area)
+        }
+        PaneOverlay::Rename { .. } | PaneOverlay::CloseConfirm => centered_fixed(44, 7, area),
+        PaneOverlay::Status => centered_fixed(48, 11, area),
+    }
+}
+
+fn render_pane_overlay(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    overlay: &PaneOverlay,
+    active: &PaneDescriptor,
+    roster: &[PaneDescriptor],
+) {
+    let popup = pane_overlay_rect(area, overlay, roster.len());
+    frame.render_widget(WidgetClear, popup);
+    let lines = match overlay {
+        PaneOverlay::Menu { selected } => {
+            let labels = [
+                "SWITCH PANE",
+                "RENAME",
+                "DETAILS",
+                "CLOSE PANE",
+                "WORKSPACE",
+                "CANCEL",
+            ];
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    active.label.clone(),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "↑↓ Navigate · Enter · Esc",
+                    Style::default().fg(muted()),
+                )),
+            ];
+            lines.extend(labels.into_iter().enumerate().map(|(index, label)| {
+                popup_menu_line(label, *selected == index, popup.width.saturating_sub(2))
+            }));
+            lines
+        }
+        PaneOverlay::Switch { selected } => {
+            let mut lines = vec![Line::from(Span::styled(
+                "Switch pane",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ))];
+            lines.extend(roster.iter().enumerate().map(|(index, pane)| {
+                popup_menu_line(
+                    &format!("{} · {}", pane.label, pane.agent),
+                    *selected == index,
+                    popup.width.saturating_sub(2),
+                )
+            }));
+            lines.push(Line::from(Span::styled(
+                "Esc · back",
+                Style::default().fg(muted()),
+            )));
+            lines
+        }
+        PaneOverlay::Rename { value } => vec![
+            Line::from(Span::styled(
+                "Rename pane",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(value.clone()),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Enter · save     Esc · cancel",
+                Style::default().fg(muted()),
+            )),
+        ],
+        PaneOverlay::Status => vec![
+            Line::from(Span::styled(
+                active.label.clone(),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(format!("Agent       {}", active.agent)),
+            Line::raw(format!("State       {}", active.state)),
+            Line::raw(format!("Tab         {}", active.tab)),
+            Line::raw(format!("Pane ID     {}", active.pane_id)),
+            Line::raw(""),
+            Line::from(Span::styled(
+                active
+                    .resume_command
+                    .as_deref()
+                    .unwrap_or("No saved resume command"),
+                Style::default().fg(muted()),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled("Esc · back", Style::default().fg(muted()))),
+        ],
+        PaneOverlay::CloseConfirm => vec![
+            Line::from(Span::styled(
+                format!("Close {}?", active.label),
+                Style::default().fg(error()).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("The running process will stop."),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("CANCEL", Style::default().fg(muted())),
+                Span::raw("                 "),
+                Span::styled("CLOSE", Style::default().fg(error())),
+            ]),
+        ],
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(accent()))
+                .title(" PANE "),
+        ),
+        popup,
+    );
+}
+
+fn render_offline_pane(frame: &mut ratatui::Frame, area: Rect, active: &PaneDescriptor) {
+    let popup = offline_pane_rect(area);
+    frame.render_widget(WidgetClear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "PANE OFFLINE",
+                Style::default().fg(error()).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw(format!("{} has stopped.", active.label)),
+            Line::raw(""),
+            Line::from(Span::styled(
+                if active.resume_command.is_some() {
+                    "WORKSPACE · saved session can resume"
+                } else {
+                    "WORKSPACE"
+                },
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )),
+        ])
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(error()))
+                .title(" PANE "),
+        ),
+        popup,
+    );
+}
+
+fn offline_pane_rect(area: Rect) -> Rect {
+    centered_fixed(44, 7, area)
+}
+
+fn offline_pane_action_rect(area: Rect) -> Rect {
+    let popup = offline_pane_rect(area);
+    Rect::new(
+        popup.x.saturating_add(1),
+        popup.bottom().saturating_sub(2),
+        popup.width.saturating_sub(2),
+        1,
+    )
+}
+
 fn embedded_pane(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state_dir: &PathBuf,
-    pane_id: &str,
-    pane_label: &str,
-    preview: Option<&PanePreview>,
+    state_dir: &Path,
+    pane: &PaneDescriptor,
+    roster: &[PaneDescriptor],
 ) -> Result<EmbeddedPaneExit> {
     let screen = terminal.size()?;
-    let portrait = compact_layout(screen.width);
-    // A background pane preview requires synchronous snapshot RPC and a
-    // second terminal render. Pause it while attached: live input latency is
-    // more important than passive chrome.
-    let preview_rows = 0;
-    // The terminal viewport has left/right borders, so the PTY must be two
-    // columns narrower than the outer screen or its last cells will wrap.
-    let cols = screen.width.saturating_sub(2).max(20);
-    let header_rows = if portrait { 1 } else { 3 };
-    let rows = screen
-        .height
-        .saturating_sub(header_rows)
-        .saturating_sub(preview_rows)
-        .max(4);
+    let screen_area = Rect::new(0, 0, screen.width, screen.height);
+    let layout = pane_layout(screen_area);
+    let cols = layout.terminal.width.max(20);
+    let rows = layout.terminal.height.max(4);
+    let pane_id = pane.pane_id.clone();
+    let mut active = pane.clone();
+    let mut roster = roster.to_vec();
     let mut stream = UnixStream::connect(state_dir.join("workspace.sock"))?;
     serde_json::to_writer(
         &mut stream,
         &Request::Attach {
-            pane_id: pane_id.to_owned(),
+            pane_id: pane_id.clone(),
             cols,
             rows,
         },
@@ -1337,8 +1886,17 @@ fn embedded_pane(
 
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let input_modes = Arc::new(Mutex::new(PaneInputModes::default()));
-    let (_input_pump, input_rx) =
-        start_pane_input_pump(Arc::clone(&writer), Arc::clone(&input_modes));
+    let chrome_active = Arc::new(AtomicBool::new(false));
+    let (_input_pump, input_rx) = start_pane_input_pump(
+        Arc::clone(&writer),
+        Arc::clone(&input_modes),
+        Arc::clone(&chrome_active),
+    );
+    let (_roster_pump, roster_rx) = start_pane_roster_pump(
+        state_dir.to_path_buf(),
+        active.workspace_root.clone(),
+        active.tab.clone(),
+    );
 
     let (output_tx, output_rx) = mpsc::channel();
     let mut reader = stream.try_clone()?;
@@ -1357,7 +1915,23 @@ fn embedded_pane(
     let mut last_draw = Instant::now() - Duration::from_millis(34);
     let mut prior_screen: Option<workspace_terminal::Snapshot> = None;
     let mut retained_frame: Option<Buffer> = None;
+    let mut overlay: Option<PaneOverlay> = None;
     loop {
+        // Keep routing state derived from the authoritative UI state. The
+        // touch acknowledgement below makes transitions into this state
+        // atomic from the input thread's point of view.
+        chrome_active.store(overlay.is_some(), Ordering::Release);
+        while let Ok(updated) = roster_rx.try_recv() {
+            if let Some(refreshed) = updated
+                .iter()
+                .find(|candidate| candidate.pane_id == pane_id)
+                .cloned()
+            {
+                active = refreshed;
+            }
+            roster = updated;
+            needs_draw = true;
+        }
         loop {
             match output_rx.try_recv() {
                 Ok(data) => {
@@ -1381,67 +1955,47 @@ fn embedded_pane(
         }
         if needs_draw && last_draw.elapsed() >= Duration::from_millis(33) {
             let active_screen = terminal_grid.snapshot();
+            let scrollback_offset = terminal_grid.display_offset();
             let dirty_rows = changed_terminal_rows(prior_screen.as_ref(), &active_screen);
             let full_terminal_draw = retained_frame.is_none();
             let completed = terminal.draw(|frame| {
                 if let Some(previous) = retained_frame.as_ref() {
                     *frame.buffer_mut() = previous.clone();
                 }
-                let area = frame.area();
-                let mut constraints = vec![Constraint::Length(header_rows), Constraint::Min(4)];
-                if preview_rows > 0 {
-                    constraints.push(Constraint::Length(preview_rows));
-                }
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(constraints)
-                    .split(area);
-                let header = if portrait {
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            "● ",
-                            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            pane_label.to_owned(),
-                            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                        ),
-                    ]))
-                } else {
-                    Paragraph::new(vec![
-                        Line::from(vec![
-                            Span::styled(
-                                " ● ACTIVE ",
-                                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!("  {pane_label}"),
-                                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        Line::from(Span::styled(
-                            if offline {
-                                "   pane offline · tap to return".to_owned()
-                            } else {
-                                format!(
-                                    "   pane {} · input routed here",
-                                    &pane_id[..pane_id.len().min(8)]
-                                )
-                            },
-                            Style::default().fg(if offline { error() } else { muted() }),
-                        )),
-                    ])
-                    .block(Block::default().borders(Borders::BOTTOM))
-                };
-                frame.render_widget(header, chunks[0]);
-                let pane_block = Block::default()
-                    .borders(Borders::LEFT | Borders::RIGHT)
-                    .border_style(Style::default().fg(border()));
-                let pane_inner = pane_block.inner(chunks[1]);
-                frame.render_widget(pane_block, chunks[1]);
+                let header = pane_header_areas(layout.header);
+                // The retained-frame renderer only repaints changed terminal
+                // rows. Clear Bastion's chrome explicitly so shorter status
+                // labels never leave characters from the previous state.
+                frame.render_widget(WidgetClear, layout.header);
+                frame.render_widget(
+                    Paragraph::new("‹ WORKSPACE")
+                        .style(Style::default().fg(muted()))
+                        .alignment(ratatui::layout::Alignment::Left),
+                    header.workspace,
+                );
+                let center_text = pane_header_status(&active, offline, scrollback_offset);
+                frame.render_widget(
+                    Paragraph::new(truncate_display_label(
+                        &center_text,
+                        usize::from(header.status.width),
+                    ))
+                    .style(
+                        Style::default()
+                            .fg(if offline { error() } else { accent() })
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .alignment(ratatui::layout::Alignment::Center),
+                    header.status,
+                );
+                frame.render_widget(
+                    Paragraph::new(if scrollback_offset > 0 { "LIVE" } else { "⋯" })
+                        .style(Style::default().fg(accent()).add_modifier(Modifier::BOLD))
+                        .alignment(ratatui::layout::Alignment::Center),
+                    header.action,
+                );
                 render_terminal_grid(
                     frame,
-                    pane_inner,
+                    layout.terminal,
                     &active_screen,
                     if full_terminal_draw {
                         None
@@ -1449,6 +2003,14 @@ fn embedded_pane(
                         Some(&dirty_rows)
                     },
                 );
+                if layout.rail.width > 0 {
+                    render_pane_rail(frame, layout.rail, &active, &roster);
+                }
+                if let Some(overlay) = overlay.as_ref() {
+                    render_pane_overlay(frame, screen_area, overlay, &active, &roster);
+                } else if offline {
+                    render_offline_pane(frame, screen_area, &active);
+                }
             })?;
             retained_frame = Some(completed.buffer.clone());
             prior_screen = Some(active_screen);
@@ -1465,23 +2027,221 @@ fn embedded_pane(
             continue;
         };
         match event {
+            PaneInputEvent::Paste(text) => {
+                if let Some(PaneOverlay::Rename { value }) = overlay.as_mut() {
+                    value.push_str(&text);
+                    invalidate_pane_frame(&mut retained_frame, &mut prior_screen);
+                    needs_draw = true;
+                }
+            }
+            PaneInputEvent::Key(key) => {
+                // Modal chrome is painted over a retained terminal frame.
+                // Invalidate that frame for every modal key so dismissing a
+                // popup (or changing to a differently sized popup) cannot
+                // leave stale pixels while input has already returned to the
+                // PTY behind it.
+                invalidate_pane_frame(&mut retained_frame, &mut prior_screen);
+                let Some(current) = overlay.take() else {
+                    chrome_active.store(false, Ordering::Release);
+                    continue;
+                };
+                match current {
+                    PaneOverlay::Menu { mut selected } => match modal_navigation(&key.code) {
+                        ModalNavigation::Cancel => chrome_active.store(false, Ordering::Release),
+                        ModalNavigation::Previous => {
+                            selected = selected.saturating_sub(1);
+                            overlay = Some(PaneOverlay::Menu { selected });
+                        }
+                        ModalNavigation::Next => {
+                            selected = (selected + 1).min(5);
+                            overlay = Some(PaneOverlay::Menu { selected });
+                        }
+                        ModalNavigation::Confirm => match selected {
+                            0 => {
+                                let selected = roster
+                                    .iter()
+                                    .position(|candidate| candidate.pane_id == pane_id)
+                                    .unwrap_or(0);
+                                overlay = Some(PaneOverlay::Switch { selected });
+                            }
+                            1 => {
+                                overlay = Some(PaneOverlay::Rename {
+                                    value: active.label.clone(),
+                                })
+                            }
+                            2 => overlay = Some(PaneOverlay::Status),
+                            3 => overlay = Some(PaneOverlay::CloseConfirm),
+                            4 => return Ok(EmbeddedPaneExit::Workspace),
+                            _ => chrome_active.store(false, Ordering::Release),
+                        },
+                        _ => overlay = Some(PaneOverlay::Menu { selected }),
+                    },
+                    PaneOverlay::Switch { mut selected } => match modal_navigation(&key.code) {
+                        ModalNavigation::Cancel => {
+                            overlay = Some(PaneOverlay::Menu { selected: 0 })
+                        }
+                        ModalNavigation::Previous => {
+                            selected = selected.saturating_sub(1);
+                            overlay = Some(PaneOverlay::Switch { selected });
+                        }
+                        ModalNavigation::Next => {
+                            selected = (selected + 1).min(roster.len().saturating_sub(1));
+                            overlay = Some(PaneOverlay::Switch { selected });
+                        }
+                        ModalNavigation::Confirm if !roster.is_empty() => {
+                            return Ok(EmbeddedPaneExit::Focus {
+                                pane_id: roster[selected].pane_id.clone(),
+                                roster,
+                            });
+                        }
+                        _ => overlay = Some(PaneOverlay::Switch { selected }),
+                    },
+                    PaneOverlay::Rename { mut value } => match key.code {
+                        KeyCode::Esc => overlay = Some(PaneOverlay::Menu { selected: 1 }),
+                        KeyCode::Backspace => {
+                            value.pop();
+                            overlay = Some(PaneOverlay::Rename { value });
+                        }
+                        KeyCode::Char(character) if is_unmodified_text_key(&key) => {
+                            value.push(character);
+                            overlay = Some(PaneOverlay::Rename { value });
+                        }
+                        KeyCode::Enter if !value.trim().is_empty() => {
+                            let response = dashboard_request(
+                                state_dir,
+                                Request::RenamePane {
+                                    pane_id: pane_id.clone(),
+                                    name: value.trim().to_owned(),
+                                },
+                            )?;
+                            if response.get("type").and_then(serde_json::Value::as_str)
+                                == Some("error")
+                            {
+                                overlay = Some(PaneOverlay::Rename { value });
+                            } else {
+                                active.label = value.trim().to_owned();
+                                chrome_active.store(false, Ordering::Release);
+                            }
+                        }
+                        _ => overlay = Some(PaneOverlay::Rename { value }),
+                    },
+                    PaneOverlay::Status => match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            overlay = Some(PaneOverlay::Menu { selected: 2 })
+                        }
+                        _ => overlay = Some(PaneOverlay::Status),
+                    },
+                    PaneOverlay::CloseConfirm => match key.code {
+                        KeyCode::Esc => overlay = Some(PaneOverlay::Menu { selected: 3 }),
+                        KeyCode::Enter => {
+                            dashboard_request(
+                                state_dir,
+                                Request::StopPane {
+                                    pane_id: pane_id.clone(),
+                                },
+                            )?;
+                            return Ok(EmbeddedPaneExit::Workspace);
+                        }
+                        _ => overlay = Some(PaneOverlay::CloseConfirm),
+                    },
+                }
+                needs_draw = true;
+            }
+            PaneInputEvent::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && overlay.is_some() =>
+            {
+                invalidate_pane_frame(&mut retained_frame, &mut prior_screen);
+                let current = overlay.take().expect("overlay checked above");
+                let popup = pane_overlay_rect(screen_area, &current, roster.len());
+                if !contains(popup, mouse.column, mouse.row) {
+                    chrome_active.store(false, Ordering::Release);
+                    needs_draw = true;
+                    continue;
+                }
+                match current {
+                    PaneOverlay::Menu { selected } => {
+                        let row = usize::from(mouse.row.saturating_sub(popup.y));
+                        let choice = row.saturating_sub(3);
+                        match choice {
+                            0 => {
+                                let selected = roster
+                                    .iter()
+                                    .position(|candidate| candidate.pane_id == pane_id)
+                                    .unwrap_or(0);
+                                overlay = Some(PaneOverlay::Switch { selected });
+                            }
+                            1 => {
+                                overlay = Some(PaneOverlay::Rename {
+                                    value: active.label.clone(),
+                                })
+                            }
+                            2 => overlay = Some(PaneOverlay::Status),
+                            3 => overlay = Some(PaneOverlay::CloseConfirm),
+                            4 => return Ok(EmbeddedPaneExit::Workspace),
+                            5 => chrome_active.store(false, Ordering::Release),
+                            _ => overlay = Some(PaneOverlay::Menu { selected }),
+                        }
+                    }
+                    PaneOverlay::Switch { selected } => {
+                        let index =
+                            usize::from(mouse.row.saturating_sub(popup.y.saturating_add(2)));
+                        if let Some(next) = roster.get(index) {
+                            return Ok(EmbeddedPaneExit::Focus {
+                                pane_id: next.pane_id.clone(),
+                                roster,
+                            });
+                        }
+                        overlay = Some(PaneOverlay::Switch { selected });
+                    }
+                    PaneOverlay::Status => overlay = Some(PaneOverlay::Menu { selected: 2 }),
+                    PaneOverlay::CloseConfirm => {
+                        if mouse.row == popup.y.saturating_add(5)
+                            && mouse.column >= popup.x.saturating_add(popup.width / 2)
+                        {
+                            dashboard_request(
+                                state_dir,
+                                Request::StopPane {
+                                    pane_id: pane_id.clone(),
+                                },
+                            )?;
+                            return Ok(EmbeddedPaneExit::Workspace);
+                        }
+                        overlay = Some(PaneOverlay::Menu { selected: 3 });
+                    }
+                    PaneOverlay::Rename { value } => overlay = Some(PaneOverlay::Rename { value }),
+                }
+                needs_draw = true;
+            }
             PaneInputEvent::Reattach => return Ok(EmbeddedPaneExit::Reattach),
+            PaneInputEvent::Mouse(mouse)
+                if offline
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && contains(
+                        offline_pane_action_rect(screen_area),
+                        mouse.column,
+                        mouse.row,
+                    ) =>
+            {
+                return Ok(EmbeddedPaneExit::Workspace);
+            }
             PaneInputEvent::Mouse(mouse)
                 if matches!(
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                ) && mouse.column >= 1
-                    && mouse.column < screen.width.saturating_sub(1)
-                    && mouse.row >= header_rows
-                    && mouse.row < header_rows.saturating_add(rows) =>
+                ) && contains(layout.terminal, mouse.column, mouse.row) =>
             {
                 // A terminal viewport should scroll locally first. This is
                 // the familiar Termux behavior and does not require every
                 // agent TUI to implement touch/mouse scrolling itself.
-                let x = mouse.column.saturating_sub(1).min(cols.saturating_sub(1)) + 1;
+                let x = mouse
+                    .column
+                    .saturating_sub(layout.terminal.x)
+                    .min(cols.saturating_sub(1))
+                    + 1;
                 let y = mouse
                     .row
-                    .saturating_sub(header_rows)
+                    .saturating_sub(layout.terminal.y)
                     .min(rows.saturating_sub(1))
                     + 1;
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
@@ -1499,33 +2259,69 @@ fn embedded_pane(
             }
             PaneInputEvent::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && (offline || mouse.row < header_rows) =>
+                    && contains(
+                        pane_header_areas(layout.header).workspace,
+                        mouse.column,
+                        mouse.row,
+                    ) =>
             {
                 return Ok(EmbeddedPaneExit::Workspace);
             }
             PaneInputEvent::Mouse(mouse)
-                if preview_rows > 0
-                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && mouse.row >= screen.height.saturating_sub(preview_rows) =>
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && contains(
+                        pane_header_areas(layout.header).action,
+                        mouse.column,
+                        mouse.row,
+                    )
+                    && terminal_grid.display_offset() > 0 =>
             {
-                if let Some(preview) = preview {
-                    return Ok(EmbeddedPaneExit::Focus(preview.pane_id.clone()));
+                terminal_grid.scroll_viewport_to_bottom();
+                needs_draw = true;
+            }
+            PaneInputEvent::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && contains(
+                        pane_header_areas(layout.header).action,
+                        mouse.column,
+                        mouse.row,
+                    ) =>
+            {
+                overlay = Some(PaneOverlay::Menu { selected: 0 });
+                chrome_active.store(true, Ordering::Release);
+                needs_draw = true;
+            }
+            PaneInputEvent::Mouse(mouse)
+                if layout.rail.width > 0
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && contains(layout.rail, mouse.column, mouse.row)
+                    && mouse.row >= layout.rail.y.saturating_add(4) =>
+            {
+                let index = usize::from(mouse.row.saturating_sub(layout.rail.y + 4));
+                if let Some(next) = roster.get(index)
+                    && next.pane_id != pane_id
+                {
+                    return Ok(EmbeddedPaneExit::Focus {
+                        pane_id: next.pane_id.clone(),
+                        roster,
+                    });
                 }
             }
             PaneInputEvent::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && mouse.column >= 1
-                    && mouse.column < screen.width.saturating_sub(1)
-                    && mouse.row >= header_rows
-                    && mouse.row < header_rows.saturating_add(rows) =>
+                    && contains(layout.terminal, mouse.column, mouse.row) =>
             {
                 // Claude/Codex fullscreen TUIs opt into terminal mouse input
                 // for caret placement. Bastion owns its header, but content
                 // taps belong to the PTY at its local 1-based cell position.
-                let x = mouse.column.saturating_sub(1).min(cols.saturating_sub(1)) + 1;
+                let x = mouse
+                    .column
+                    .saturating_sub(layout.terminal.x)
+                    .min(cols.saturating_sub(1))
+                    + 1;
                 let y = mouse
                     .row
-                    .saturating_sub(header_rows)
+                    .saturating_sub(layout.terminal.y)
                     .min(rows.saturating_sub(1))
                     + 1;
                 if let Some(bytes) = pane_click_bytes(terminal_grid.mouse_protocol(), x, y)
@@ -1546,8 +2342,11 @@ fn embedded_pane(
             }
             PaneInputEvent::Workspace => return Ok(EmbeddedPaneExit::Workspace),
             PaneInputEvent::FocusPreview => {
-                if let Some(preview) = preview {
-                    return Ok(EmbeddedPaneExit::Focus(preview.pane_id.clone()));
+                if let Some(next_id) = next_pane_id(&roster, &pane_id) {
+                    return Ok(EmbeddedPaneExit::Focus {
+                        pane_id: next_id,
+                        roster,
+                    });
                 }
             }
             PaneInputEvent::Offline => {
@@ -1803,6 +2602,7 @@ fn key_to_bytes(
 #[derive(Clone, Copy)]
 enum DashboardAction {
     NewTab,
+    RenameTab,
     NewShell,
     Resume,
     DeleteTab,
@@ -1824,9 +2624,13 @@ fn window_dashboard_loop(
     notice: &mut String,
 ) -> Result<DashboardExit> {
     let mut selected_tab = *remembered_tab;
-    let mut selected_pane = 0_usize;
+    let mut selected_panes = HashMap::<String, String>::new();
+    let mut pane_offsets = HashMap::<String, usize>::new();
     let mut input: Option<DashboardInput> = None;
     let mut manage_open = false;
+    let mut pane_menu_selected = 0_usize;
+    let mut tab_menu_open = false;
+    let mut tab_menu_selected = 0_usize;
     let mut resume_picker_open = false;
     let mut selected_resume = 0_usize;
     loop {
@@ -1860,7 +2664,7 @@ fn window_dashboard_loop(
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
         let workspace_root = workspace_root.to_string_lossy();
-        let panes: Vec<serde_json::Value> = status
+        let mut panes: Vec<serde_json::Value> = status
             .get("pane_details")
             .and_then(serde_json::Value::as_array)
             .into_iter()
@@ -1873,37 +2677,73 @@ fn window_dashboard_loop(
             })
             .cloned()
             .collect();
+        panes.sort_by_key(pane_order_key);
         let resumable_slots = saved_session_slots(&slots);
-        selected_pane = selected_pane.min(panes.len().saturating_sub(1));
+        let mut selected_pane = selected_panes
+            .get(tab_name)
+            .and_then(|selected_id| {
+                panes
+                    .iter()
+                    .position(|pane| pane_id(pane) == Some(selected_id))
+            })
+            .unwrap_or(0)
+            .min(panes.len().saturating_sub(1));
+        if let Some(id) = panes.get(selected_pane).and_then(pane_id) {
+            selected_panes.insert(tab_name.to_owned(), id.to_owned());
+        }
         selected_resume = selected_resume.min(resumable_slots.len().saturating_sub(1));
         let screen_size = terminal.size()?;
         let screen = dashboard_rect(Rect::new(0, 0, screen_size.width, screen_size.height));
         let areas = window_areas(screen);
+        let tab_hit_areas = dashboard_tab_areas(areas.tabs, tab_values.len(), selected_tab);
+        let action_hit_areas = dashboard_action_areas(areas.actions);
+        let visible_panes = usize::from(areas.panes.height.saturating_sub(2) / 2).max(1);
+        let pane_offset = pane_offsets.entry(tab_name.to_owned()).or_default();
+        if selected_pane < *pane_offset {
+            *pane_offset = selected_pane;
+        } else if selected_pane >= pane_offset.saturating_add(visible_panes) {
+            *pane_offset = selected_pane
+                .saturating_add(1)
+                .saturating_sub(visible_panes);
+        }
+        *pane_offset = (*pane_offset).min(panes.len().saturating_sub(visible_panes));
         terminal.draw(|frame| {
             draw_window_dashboard(
                 frame,
                 screen,
-                &tab_values,
-                selected_tab,
-                &panes,
-                selected_pane,
-                &slots,
-                notice.as_str(),
-                input.as_ref(),
-                manage_open,
-                resume_picker_open,
-                &resumable_slots,
-                selected_resume,
-                workspace,
+                DashboardView {
+                    tabs: &tab_values,
+                    selected_tab,
+                    panes: &panes,
+                    selected_pane,
+                    pane_offset: *pane_offset,
+                    notice: notice.as_str(),
+                    input: input.as_ref(),
+                    manage_open,
+                    pane_menu_selected,
+                    tab_menu_open,
+                    tab_menu_selected,
+                    resume_picker_open,
+                    resumable_slots: &resumable_slots,
+                    selected_resume,
+                    workspace,
+                },
             );
         })?;
 
+        if !poll(Duration::from_millis(750))? {
+            continue;
+        }
         match read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(active_input) = input.as_mut() {
+                    let confirmation = matches!(
+                        active_input.action,
+                        DashboardAction::DeleteTab | DashboardAction::StopPane
+                    );
                     match key.code {
                         KeyCode::Esc => input = None,
-                        KeyCode::Backspace => {
+                        KeyCode::Backspace if !confirmation => {
                             active_input.value.pop();
                         }
                         KeyCode::Enter => {
@@ -1920,22 +2760,26 @@ fn window_dashboard_loop(
                                 Err(error) => format!("action failed: {error:#}"),
                             };
                         }
-                        KeyCode::Char(character) => active_input.value.push(character),
+                        KeyCode::Char(character)
+                            if !confirmation && is_unmodified_text_key(&key) =>
+                        {
+                            active_input.value.push(character)
+                        }
                         _ => {}
                     }
                     continue;
                 }
                 if resume_picker_open {
-                    match key.code {
-                        KeyCode::Esc => resume_picker_open = false,
-                        KeyCode::Up | KeyCode::Char('k') => {
+                    match modal_navigation(&key.code) {
+                        ModalNavigation::Cancel => resume_picker_open = false,
+                        ModalNavigation::Previous => {
                             selected_resume = selected_resume.saturating_sub(1)
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        ModalNavigation::Next => {
                             selected_resume =
                                 (selected_resume + 1).min(resumable_slots.len().saturating_sub(1));
                         }
-                        KeyCode::Enter if !resumable_slots.is_empty() => {
+                        ModalNavigation::Confirm if !resumable_slots.is_empty() => {
                             *notice = resume_saved_slot(
                                 &resumable_slots[selected_resume],
                                 state_dir,
@@ -1948,25 +2792,51 @@ fn window_dashboard_loop(
                     }
                     continue;
                 }
+                if tab_menu_open {
+                    match modal_navigation(&key.code) {
+                        ModalNavigation::Cancel => tab_menu_open = false,
+                        ModalNavigation::Previous => {
+                            tab_menu_selected = tab_menu_selected.saturating_sub(1)
+                        }
+                        ModalNavigation::Next => tab_menu_selected = (tab_menu_selected + 1).min(2),
+                        ModalNavigation::Confirm => {
+                            match tab_menu_selected {
+                                0 => input = Some(rename_tab_input(tab_name)),
+                                1 => input = Some(new_dashboard_input(DashboardAction::DeleteTab)),
+                                _ => {}
+                            }
+                            tab_menu_open = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if manage_open {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('b') => manage_open = false,
-                        KeyCode::Char('r') if !panes.is_empty() => {
-                            input = selected_pane_input(
-                                DashboardAction::RenamePane,
-                                &panes[selected_pane],
-                            );
-                            manage_open = false;
+                    match modal_navigation(&key.code) {
+                        ModalNavigation::Cancel => manage_open = false,
+                        ModalNavigation::Previous => {
+                            pane_menu_selected = pane_menu_selected.saturating_sub(1)
                         }
-                        KeyCode::Char('d') if !panes.is_empty() => {
-                            input = selected_pane_input(
-                                DashboardAction::StopPane,
-                                &panes[selected_pane],
-                            );
-                            manage_open = false;
+                        ModalNavigation::Next => {
+                            pane_menu_selected = (pane_menu_selected + 1).min(3)
                         }
-                        KeyCode::Char('s') if !panes.is_empty() => {
-                            *notice = pane_status(&panes[selected_pane]);
+                        ModalNavigation::Confirm if !panes.is_empty() => {
+                            match pane_menu_selected {
+                                0 => {
+                                    input = selected_pane_input(
+                                        DashboardAction::RenamePane,
+                                        &panes[selected_pane],
+                                    )
+                                }
+                                1 => *notice = pane_status(&panes[selected_pane]),
+                                2 => {
+                                    input = selected_pane_input(
+                                        DashboardAction::StopPane,
+                                        &panes[selected_pane],
+                                    )
+                                }
+                                _ => {}
+                            }
                             manage_open = false;
                         }
                         _ => {}
@@ -1978,41 +2848,48 @@ fn window_dashboard_loop(
                     KeyCode::Left | KeyCode::Char('h') => {
                         selected_tab = selected_tab.saturating_sub(1);
                         *remembered_tab = selected_tab;
-                        selected_pane = 0;
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         selected_tab = (selected_tab + 1).min(tab_values.len() - 1);
                         *remembered_tab = selected_tab;
-                        selected_pane = 0;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        selected_pane = selected_pane.saturating_sub(1)
+                        selected_pane = selected_pane.saturating_sub(1);
+                        remember_selected_pane(
+                            &mut selected_panes,
+                            tab_name,
+                            &panes,
+                            selected_pane,
+                        );
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         selected_pane = (selected_pane + 1).min(panes.len().saturating_sub(1));
+                        remember_selected_pane(
+                            &mut selected_panes,
+                            tab_name,
+                            &panes,
+                            selected_pane,
+                        );
                     }
                     KeyCode::Enter if !panes.is_empty() => {
-                        let pane_id = panes[selected_pane]
-                            .get("pane_id")
-                            .and_then(serde_json::Value::as_str)
-                            .context("pane has no ID")?;
+                        let pane =
+                            pane_descriptor(&panes[selected_pane]).context("pane has no ID")?;
                         return Ok(DashboardExit::Attach {
-                            pane_id: pane_id.to_owned(),
-                            label: panes[selected_pane]
-                                .get("label")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("Pane")
-                                .to_owned(),
-                            preview: preview_for(&panes, pane_id),
+                            pane,
+                            roster: pane_roster(&panes),
                         });
                     }
                     KeyCode::Char('n') => {
                         input = Some(new_dashboard_input(DashboardAction::NewTab))
                     }
                     KeyCode::Char('x') => {
-                        input = Some(new_dashboard_input(DashboardAction::DeleteTab))
+                        tab_menu_selected = 0;
+                        tab_menu_open = true;
                     }
-                    KeyCode::Char('m') if !panes.is_empty() => manage_open = true,
+                    KeyCode::Char('m') if !panes.is_empty() => {
+                        pane_menu_selected = 0;
+                        manage_open = true;
+                    }
                     KeyCode::Char('r') => {
                         if resumable_slots.is_empty() {
                             *notice = "no saved agent sessions in this workspace".to_owned();
@@ -2026,7 +2903,126 @@ fn window_dashboard_loop(
                             Err(error) => format!("theme failed: {error:#}"),
                         };
                     }
-                    KeyCode::Char('s') => {
+                    _ => {}
+                }
+            }
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                if input.is_some() {
+                    continue;
+                }
+                if resume_picker_open {
+                    let menu = resume_menu_rect(screen, resumable_slots.len());
+                    let row = usize::from(mouse.row.saturating_sub(menu.y));
+                    let (slot_offset, visible_slots) =
+                        resume_menu_viewport(selected_resume, resumable_slots.len(), menu);
+                    let visible_index = row.saturating_sub(4);
+                    let slot_index = slot_offset.saturating_add(visible_index);
+                    if row >= 4
+                        && visible_index < visible_slots
+                        && slot_index < resumable_slots.len()
+                    {
+                        *notice = resume_saved_slot(
+                            &resumable_slots[slot_index],
+                            state_dir,
+                            workspace,
+                            tab_name,
+                        );
+                    }
+                    resume_picker_open = false;
+                    continue;
+                }
+                if tab_menu_open {
+                    let menu = tab_menu_rect(screen);
+                    if contains(menu, mouse.column, mouse.row) {
+                        match mouse.row.saturating_sub(menu.y) {
+                            4 => input = Some(rename_tab_input(tab_name)),
+                            5 => input = Some(new_dashboard_input(DashboardAction::DeleteTab)),
+                            _ => {}
+                        }
+                    }
+                    tab_menu_open = false;
+                    continue;
+                }
+                if manage_open {
+                    let menu = pane_menu_rect(screen);
+                    if contains(menu, mouse.column, mouse.row) {
+                        match mouse.row.saturating_sub(menu.y) {
+                            4 if !panes.is_empty() => {
+                                input = selected_pane_input(
+                                    DashboardAction::RenamePane,
+                                    &panes[selected_pane],
+                                );
+                            }
+                            5 if !panes.is_empty() => {
+                                *notice = pane_status(&panes[selected_pane]);
+                            }
+                            6 if !panes.is_empty() => {
+                                input = selected_pane_input(
+                                    DashboardAction::StopPane,
+                                    &panes[selected_pane],
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    manage_open = false;
+                    continue;
+                }
+                if contains(areas.tabs, mouse.column, mouse.row) {
+                    if contains(tab_hit_areas.add, mouse.column, mouse.row) {
+                        input = Some(new_dashboard_input(DashboardAction::NewTab));
+                    } else if contains(tab_hit_areas.manage, mouse.column, mouse.row) {
+                        tab_menu_selected = 0;
+                        tab_menu_open = true;
+                    } else if tab_hit_areas.compact
+                        && contains(tab_hit_areas.previous, mouse.column, mouse.row)
+                    {
+                        selected_tab = selected_tab.saturating_sub(1);
+                    } else if tab_hit_areas.compact
+                        && contains(tab_hit_areas.next, mouse.column, mouse.row)
+                    {
+                        selected_tab = (selected_tab + 1).min(tab_values.len() - 1);
+                    } else if let Some((index, _)) = tab_hit_areas
+                        .tabs
+                        .iter()
+                        .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+                    {
+                        selected_tab = *index;
+                    }
+                    *remembered_tab = selected_tab;
+                } else if contains(areas.panes, mouse.column, mouse.row) && !panes.is_empty() {
+                    let relative_row = mouse.row.saturating_sub(areas.panes.y.saturating_add(1));
+                    let index = pane_offset.saturating_add(usize::from(relative_row / 2));
+                    if index < panes.len() {
+                        selected_pane = index;
+                        remember_selected_pane(
+                            &mut selected_panes,
+                            tab_name,
+                            &panes,
+                            selected_pane,
+                        );
+                        let menu_column = areas
+                            .panes
+                            .x
+                            .saturating_add(areas.panes.width.saturating_sub(7));
+                        if mouse.column >= menu_column {
+                            pane_menu_selected = 0;
+                            manage_open = true;
+                            continue;
+                        }
+                        let pane = pane_descriptor(&panes[index]).context("pane has no ID")?;
+                        return Ok(DashboardExit::Attach {
+                            pane,
+                            roster: pane_roster(&panes),
+                        });
+                    }
+                } else if contains(areas.actions, mouse.column, mouse.row) {
+                    if mouse.row != areas.actions.y.saturating_add(1) {
+                        continue;
+                    }
+                    if contains(action_hit_areas[0], mouse.column, mouse.row) {
                         *notice = match execute_dashboard_action(
                             DashboardAction::NewShell,
                             "",
@@ -2038,205 +3034,82 @@ fn window_dashboard_loop(
                             Ok(message) => message,
                             Err(error) => format!("action failed: {error:#}"),
                         };
+                    } else if contains(action_hit_areas[1], mouse.column, mouse.row) {
+                        if resumable_slots.is_empty() {
+                            *notice = "no saved agent sessions in this workspace".to_owned()
+                        } else {
+                            resume_picker_open = true;
+                        }
+                    } else if contains(action_hit_areas[2], mouse.column, mouse.row) {
+                        return Ok(DashboardExit::Quit);
                     }
-                    _ => {}
                 }
             }
             Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) && contains(areas.panes, mouse.column, mouse.row)
+                    && !panes.is_empty() =>
             {
-                if input.is_some() {
-                    continue;
-                }
-                if resume_picker_open {
-                    let menu = resume_menu_rect(screen);
-                    let row = usize::from(mouse.row.saturating_sub(menu.y));
-                    let slot_index = row.saturating_sub(3);
-                    if row >= 3 && slot_index < resumable_slots.len() {
-                        *notice = resume_saved_slot(
-                            &resumable_slots[slot_index],
-                            state_dir,
-                            workspace,
-                            tab_name,
-                        );
-                    }
-                    resume_picker_open = false;
-                    continue;
-                }
-                if manage_open {
-                    let menu = pane_menu_rect(screen);
-                    match mouse.row.saturating_sub(menu.y) {
-                        4 if !panes.is_empty() => {
-                            input = selected_pane_input(
-                                DashboardAction::RenamePane,
-                                &panes[selected_pane],
-                            );
-                            manage_open = false;
-                        }
-                        5 if !panes.is_empty() => {
-                            input = selected_pane_input(
-                                DashboardAction::StopPane,
-                                &panes[selected_pane],
-                            );
-                            manage_open = false;
-                        }
-                        6 if !panes.is_empty() => {
-                            *notice = pane_status(&panes[selected_pane]);
-                            manage_open = false;
-                        }
-                        _ => manage_open = false,
-                    }
-                    continue;
-                }
-                if contains(areas.tabs, mouse.column, mouse.row) {
-                    if compact_layout(screen.width) {
-                        // Portrait has a deliberately compact tab strip:
-                        // tap its left/right half to move through tabs.
-                        if mouse.column < areas.tabs.x.saturating_add(areas.tabs.width / 2) {
-                            selected_tab = selected_tab.saturating_sub(1);
-                        } else {
-                            selected_tab = (selected_tab + 1).min(tab_values.len() - 1);
-                        }
-                    } else {
-                        let tab_width = areas.tabs.width.max(1);
-                        let tapped_tab = (usize::from(mouse.column.saturating_sub(areas.tabs.x))
-                            * tab_values.len()
-                            / usize::from(tab_width))
-                        .min(tab_values.len() - 1);
-                        selected_tab = tapped_tab;
-                    }
-                    *remembered_tab = selected_tab;
-                    selected_pane = 0;
-                } else if contains(areas.panes, mouse.column, mouse.row) && !panes.is_empty() {
-                    let index =
-                        usize::from(mouse.row.saturating_sub(areas.panes.y.saturating_add(1)));
-                    if index < panes.len() {
-                        // A first tap changes the selection, enabling the
-                        // touch actions below.  Tapping the selected pane
-                        // again opens it, preserving a quick path into it.
-                        if index != selected_pane {
-                            selected_pane = index;
-                            *notice = format!(
-                                "selected {} · tap again to open",
-                                panes[index]
-                                    .get("label")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("Pane")
-                            );
-                            continue;
-                        }
-                        let pane_id = panes[index]
-                            .get("pane_id")
-                            .and_then(serde_json::Value::as_str)
-                            .context("pane has no ID")?;
-                        return Ok(DashboardExit::Attach {
-                            pane_id: pane_id.to_owned(),
-                            label: panes[index]
-                                .get("label")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("Pane")
-                                .to_owned(),
-                            preview: preview_for(&panes, pane_id),
-                        });
-                    }
-                } else if contains(areas.actions, mouse.column, mouse.row) {
-                    if mouse.row != areas.actions.y.saturating_add(1) {
-                        continue;
-                    }
-                    let action = usize::from(mouse.column.saturating_sub(areas.actions.x)) * 4
-                        / usize::from(areas.actions.width.max(1));
-                    match action {
-                        0 => input = Some(new_dashboard_input(DashboardAction::NewTab)),
-                        1 => {
-                            *notice = match execute_dashboard_action(
-                                DashboardAction::NewShell,
-                                "",
-                                None,
-                                state_dir,
-                                workspace,
-                                tab_name,
-                            ) {
-                                Ok(message) => message,
-                                Err(error) => format!("action failed: {error:#}"),
-                            };
-                        }
-                        2 if resumable_slots.is_empty() => {
-                            *notice = "no saved agent sessions in this workspace".to_owned()
-                        }
-                        2 => resume_picker_open = true,
-                        _ if panes.is_empty() => {
-                            *notice = "select or create a pane first".to_owned()
-                        }
-                        _ => manage_open = true,
-                    }
-                }
+                selected_pane = scrolled_pane_selection(
+                    selected_pane,
+                    panes.len(),
+                    matches!(mouse.kind, MouseEventKind::ScrollUp),
+                );
+                remember_selected_pane(&mut selected_panes, tab_name, &panes, selected_pane);
             }
             _ => {}
         }
     }
 }
 
-fn preview_for(panes: &[serde_json::Value], active_id: &str) -> Option<PanePreview> {
-    panes
-        .iter()
-        .find(|pane| pane.get("pane_id").and_then(serde_json::Value::as_str) != Some(active_id))
-        .and_then(|pane| {
-            Some(PanePreview {
-                pane_id: pane.get("pane_id")?.as_str()?.to_owned(),
-                label: pane
-                    .get("label")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Pane")
-                    .to_owned(),
-            })
-        })
-}
-
 struct WindowAreas {
+    identity: Rect,
     tabs: Rect,
     panes: Rect,
-    slots: Rect,
+    details: Rect,
     actions: Rect,
+    notice: Rect,
 }
 
 fn dashboard_rect(screen: Rect) -> Rect {
-    let portrait = compact_layout(screen.width);
-    let height = if portrait {
-        screen.height.min(15)
-    } else {
-        screen.height.min(20)
-    };
-    Rect {
-        x: screen.x,
-        y: if portrait {
-            screen.y
-        } else {
-            screen
-                .y
-                .saturating_add((screen.height.saturating_sub(height)) / 3)
-        },
-        width: screen.width,
-        height,
-    }
+    screen
+}
+
+fn wide_dashboard(area: Rect) -> bool {
+    area.width >= 72 && area.width > area.height.saturating_mul(2)
 }
 
 fn window_areas(area: Rect) -> WindowAreas {
-    let portrait = compact_layout(area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(if portrait { 0 } else { 3 }),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
+    let body = if wide_dashboard(area) {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+            .split(chunks[2])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100), Constraint::Length(0)])
+            .split(chunks[2])
+    };
     WindowAreas {
-        tabs: chunks[0],
-        panes: chunks[1],
-        slots: chunks[2],
+        identity: chunks[0],
+        tabs: chunks[1],
+        panes: body[0],
+        details: body[1],
         actions: chunks[3],
+        notice: chunks[4],
     }
 }
 
@@ -2252,6 +3125,14 @@ fn new_dashboard_input(action: DashboardAction) -> DashboardInput {
         action,
         value: String::new(),
         target: None,
+    }
+}
+
+fn rename_tab_input(name: &str) -> DashboardInput {
+    DashboardInput {
+        action: DashboardAction::RenameTab,
+        value: name.to_owned(),
+        target: Some(name.to_owned()),
     }
 }
 
@@ -2295,11 +3176,46 @@ fn pane_status(pane: &serde_json::Value) -> String {
 }
 
 fn pane_menu_rect(area: Rect) -> Rect {
-    centered_rect(92, 88, area)
+    centered_fixed(40, 9, area)
 }
 
-fn resume_menu_rect(area: Rect) -> Rect {
-    centered_rect(92, 88, area)
+fn tab_menu_rect(area: Rect) -> Rect {
+    centered_fixed(38, 8, area)
+}
+
+fn popup_menu_line(label: &str, selected: bool, width: u16) -> Line<'static> {
+    let text = format!(
+        "  {label:<width$}",
+        width = usize::from(width.saturating_sub(2))
+    );
+    Line::from(Span::styled(
+        text,
+        if selected {
+            Style::default()
+                .fg(accent())
+                .bg(focus_background())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        },
+    ))
+}
+
+fn resume_menu_rect(area: Rect, slot_count: usize) -> Rect {
+    let visible_slots = slot_count.clamp(1, 5) as u16;
+    centered_fixed(44, visible_slots.saturating_add(7), area)
+}
+
+fn resume_menu_viewport(selected: usize, slot_count: usize, menu: Rect) -> (usize, usize) {
+    let visible = usize::from(menu.height.saturating_sub(7)).min(slot_count);
+    if visible == 0 {
+        return (0, 0);
+    }
+    let offset = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(slot_count.saturating_sub(visible));
+    (offset, visible)
 }
 
 fn saved_session_slots(slots: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -2323,8 +3239,8 @@ fn saved_session_slots(slots: &serde_json::Value) -> Vec<serde_json::Value> {
 
 fn resume_saved_slot(
     slot: &serde_json::Value,
-    state_dir: &PathBuf,
-    workspace: &PathBuf,
+    state_dir: &Path,
+    workspace: &Path,
     tab: &str,
 ) -> String {
     let agent = slot
@@ -2354,9 +3270,10 @@ fn resume_saved_slot(
 fn action_label(action: DashboardAction) -> &'static str {
     match action {
         DashboardAction::NewTab => "New tab name",
+        DashboardAction::RenameTab => "Rename tab",
         DashboardAction::NewShell => "New shell",
         DashboardAction::Resume => "Resume: agent slot",
-        DashboardAction::DeleteTab => "Close selected tab? Enter confirms · Esc cancels",
+        DashboardAction::DeleteTab => "Delete selected tab? Enter confirms · Esc cancels",
         DashboardAction::StopPane => "Stop selected pane? Enter confirms · Esc cancels",
         DashboardAction::RenamePane => "Pane name",
     }
@@ -2366,8 +3283,8 @@ fn execute_dashboard_action(
     action: DashboardAction,
     value: &str,
     target: Option<&str>,
-    state_dir: &PathBuf,
-    workspace: &PathBuf,
+    state_dir: &Path,
+    workspace: &Path,
     tab: &str,
 ) -> Result<String> {
     let response = match action {
@@ -2378,6 +3295,17 @@ fn execute_dashboard_action(
                 cwd: Some(workspace.to_path_buf()),
             },
         )?,
+        DashboardAction::RenameTab => {
+            let original = target.context("no tab is selected")?;
+            dashboard_request(
+                state_dir,
+                Request::RenameTab {
+                    name: original.to_owned(),
+                    new_name: value.trim().to_owned(),
+                    cwd: Some(workspace.to_path_buf()),
+                },
+            )?
+        }
         DashboardAction::NewShell => dashboard_request(
             state_dir,
             Request::StartShell {
@@ -2430,114 +3358,425 @@ fn execute_dashboard_action(
     Ok(compact_json_message(&response, "done"))
 }
 
-fn draw_window_dashboard(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    tabs: &[serde_json::Value],
-    selected_tab: usize,
+struct DashboardTabAreas {
+    compact: bool,
+    previous: Rect,
+    next: Rect,
+    tabs: Vec<(usize, Rect)>,
+    add: Rect,
+    manage: Rect,
+}
+
+fn dashboard_action_areas(area: Rect) -> [Rect; 3] {
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(inner);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
+fn dashboard_tab_areas(area: Rect, tab_count: usize, selected_tab: usize) -> DashboardTabAreas {
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
+    );
+    let control_width = 5_u16.min(inner.width / 4);
+    let manage = Rect::new(
+        inner
+            .x
+            .saturating_add(inner.width.saturating_sub(control_width)),
+        inner.y,
+        control_width,
+        1,
+    );
+    let add = Rect::new(
+        manage.x.saturating_sub(control_width),
+        inner.y,
+        control_width,
+        1,
+    );
+    let tab_zone = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(control_width.saturating_mul(2)),
+        1,
+    );
+    let compact =
+        area.width < 64 || tab_count == 0 || usize::from(tab_zone.width) / tab_count.max(1) < 8;
+    if compact {
+        let arrow_width = 4_u16.min(tab_zone.width / 3);
+        let previous = Rect::new(tab_zone.x, tab_zone.y, arrow_width, 1);
+        let next = Rect::new(
+            tab_zone
+                .x
+                .saturating_add(tab_zone.width.saturating_sub(arrow_width)),
+            tab_zone.y,
+            arrow_width,
+            1,
+        );
+        let current = Rect::new(
+            previous.x.saturating_add(previous.width),
+            tab_zone.y,
+            tab_zone.width.saturating_sub(arrow_width.saturating_mul(2)),
+            1,
+        );
+        return DashboardTabAreas {
+            compact,
+            previous,
+            next,
+            tabs: vec![(selected_tab, current)],
+            add,
+            manage,
+        };
+    }
+
+    let mut tabs = Vec::with_capacity(tab_count);
+    let mut x = tab_zone.x;
+    for index in 0..tab_count {
+        let remaining = tab_zone.x.saturating_add(tab_zone.width).saturating_sub(x);
+        let remaining_tabs = (tab_count - index) as u16;
+        let width = remaining / remaining_tabs.max(1);
+        tabs.push((index, Rect::new(x, tab_zone.y, width, 1)));
+        x = x.saturating_add(width);
+    }
+    DashboardTabAreas {
+        compact,
+        previous: Rect::default(),
+        next: Rect::default(),
+        tabs,
+        add,
+        manage,
+    }
+}
+
+fn truncate_display_label(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_owned();
+    }
+    let content_width = max_width - 1;
+    let mut used = 0_usize;
+    let mut output = String::new();
+    for character in value.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(width) > content_width {
+            break;
+        }
+        output.push(character);
+        used = used.saturating_add(width);
+    }
+    output.push('…');
+    output
+}
+
+fn pane_id(pane: &serde_json::Value) -> Option<&str> {
+    pane.get("pane_id").and_then(serde_json::Value::as_str)
+}
+
+fn pane_label(pane: &serde_json::Value) -> &str {
+    pane.get("label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Pane")
+}
+
+fn pane_descriptor(pane: &serde_json::Value) -> Option<PaneDescriptor> {
+    Some(PaneDescriptor {
+        pane_id: pane_id(pane)?.to_owned(),
+        label: pane_label(pane).to_owned(),
+        agent: pane
+            .get("agent_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("shell")
+            .to_owned(),
+        state: pane
+            .get("agent_state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        tab: pane
+            .get("tab")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Main")
+            .to_owned(),
+        workspace_root: pane
+            .get("workspace_root")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        resume_command: pane
+            .get("resume_command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn pane_roster(panes: &[serde_json::Value]) -> Vec<PaneDescriptor> {
+    panes.iter().filter_map(pane_descriptor).collect()
+}
+
+fn pane_order_key(pane: &serde_json::Value) -> (u8, u64, String, String) {
+    let label = pane_label(pane);
+    let numbered = label
+        .strip_prefix("Pane ")
+        .and_then(|number| number.parse::<u64>().ok());
+    (
+        u8::from(numbered.is_none()),
+        numbered.unwrap_or(u64::MAX),
+        label.to_ascii_lowercase(),
+        pane_id(pane).unwrap_or_default().to_owned(),
+    )
+}
+
+fn remember_selected_pane(
+    selected: &mut HashMap<String, String>,
+    tab: &str,
     panes: &[serde_json::Value],
-    selected_pane: usize,
-    slots: &serde_json::Value,
-    notice: &str,
-    input: Option<&DashboardInput>,
-    manage_open: bool,
-    resume_picker_open: bool,
-    resumable_slots: &[serde_json::Value],
-    selected_resume: usize,
-    workspace: &PathBuf,
+    index: usize,
 ) {
+    if let Some(id) = panes.get(index).and_then(pane_id) {
+        selected.insert(tab.to_owned(), id.to_owned());
+    }
+}
+
+fn scrolled_pane_selection(selected: usize, pane_count: usize, upward: bool) -> usize {
+    if upward {
+        selected.saturating_sub(1)
+    } else {
+        (selected + 1).min(pane_count.saturating_sub(1))
+    }
+}
+
+fn pane_semantic_state(pane: &serde_json::Value) -> (&'static str, String, Color) {
+    let agent = pane.get("agent_kind").and_then(serde_json::Value::as_str);
+    let state = pane
+        .get("agent_state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let health = pane
+        .get("health")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("waiting");
+    let (marker, label, color) = match (agent, state, health) {
+        (None, _, "active") => ("◇", "shell".to_owned(), success()),
+        (None, _, _) => ("◇", "shell".to_owned(), muted()),
+        (_, "attention", _) => ("◆", "attention".to_owned(), warning()),
+        (_, "working", _) => ("●", "working".to_owned(), success()),
+        (_, "done", _) => ("✓", "done".to_owned(), accent()),
+        (_, "idle", _) => ("○", "idle".to_owned(), muted()),
+        (_, _, "active") => ("●", "active".to_owned(), success()),
+        _ => ("◌", "waiting".to_owned(), muted()),
+    };
+    (marker, label, color)
+}
+
+struct DashboardView<'a> {
+    tabs: &'a [serde_json::Value],
+    selected_tab: usize,
+    panes: &'a [serde_json::Value],
+    selected_pane: usize,
+    pane_offset: usize,
+    notice: &'a str,
+    input: Option<&'a DashboardInput>,
+    manage_open: bool,
+    pane_menu_selected: usize,
+    tab_menu_open: bool,
+    tab_menu_selected: usize,
+    resume_picker_open: bool,
+    resumable_slots: &'a [serde_json::Value],
+    selected_resume: usize,
+    workspace: &'a Path,
+}
+
+fn draw_window_dashboard(frame: &mut ratatui::Frame, area: Rect, view: DashboardView<'_>) {
+    let DashboardView {
+        tabs,
+        selected_tab,
+        panes,
+        selected_pane,
+        pane_offset,
+        notice,
+        input,
+        manage_open,
+        pane_menu_selected,
+        tab_menu_open,
+        tab_menu_selected,
+        resume_picker_open,
+        resumable_slots,
+        selected_resume,
+        workspace,
+    } = view;
     let areas = window_areas(area);
-    let portrait = compact_layout(area.width);
     let project = workspace
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
-    let tab_spans = if portrait {
+
+    let identity_inner = Rect::new(
+        areas.identity.x.saturating_add(1),
+        areas.identity.y.saturating_add(1),
+        areas.identity.width.saturating_sub(2),
+        areas.identity.height.saturating_sub(2),
+    );
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border())),
+        areas.identity,
+    );
+    let identity_left = format!(" ▪ ▪ ▪  {}", project.to_ascii_uppercase());
+    let identity_right = "WORKSPACE ";
+    let identity_spacing = " ".repeat(
+        usize::from(identity_inner.width)
+            .saturating_sub(identity_left.chars().count())
+            .saturating_sub(identity_right.chars().count()),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                identity_left,
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(identity_spacing),
+            Span::styled(identity_right, Style::default().fg(muted())),
+        ])),
+        Rect::new(identity_inner.x, identity_inner.y, identity_inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {}", workspace.display())).style(Style::default().fg(muted())),
+        Rect::new(
+            identity_inner.x,
+            identity_inner.y.saturating_add(1),
+            identity_inner.width,
+            1,
+        ),
+    );
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border()))
+            .title(" TABS "),
+        areas.tabs,
+    );
+    let tab_areas = dashboard_tab_areas(areas.tabs, tabs.len(), selected_tab);
+    if tab_areas.compact {
+        frame.render_widget(
+            Paragraph::new("‹")
+                .style(Style::default().fg(muted()))
+                .alignment(ratatui::layout::Alignment::Center),
+            tab_areas.previous,
+        );
+        frame.render_widget(
+            Paragraph::new("›")
+                .style(Style::default().fg(muted()))
+                .alignment(ratatui::layout::Alignment::Center),
+            tab_areas.next,
+        );
+    }
+    for (index, tab_area) in &tab_areas.tabs {
         let name = tabs
-            .get(selected_tab)
+            .get(*index)
             .and_then(|tab| tab.get("name"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Main");
-        vec![
-            Span::styled(" ‹ ", Style::default().fg(muted())),
-            Span::styled(
-                format!("{name}  ({}/{})", selected_tab + 1, tabs.len()),
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  › ", Style::default().fg(muted())),
-        ]
-    } else {
-        tabs.iter()
-            .enumerate()
-            .flat_map(|(index, tab)| {
-                let name = tab
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?");
-                let style = if index == selected_tab {
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+        let text = if tab_areas.compact {
+            let position = format!("  {}/{}", selected_tab + 1, tabs.len());
+            let label_width = usize::from(tab_area.width)
+                .saturating_sub(UnicodeWidthStr::width(position.as_str()));
+            format!("{}{}", truncate_display_label(name, label_width), position)
+        } else {
+            truncate_display_label(name, usize::from(tab_area.width))
+        };
+        let selected = *index == selected_tab;
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(if selected {
+                    Style::default()
+                        .fg(accent())
+                        .bg(focus_background())
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(muted())
-                };
-                [Span::styled(format!(" {name} "), style), Span::raw(" ")]
-            })
-            .collect::<Vec<_>>()
-    };
+                })
+                .alignment(ratatui::layout::Alignment::Center),
+            *tab_area,
+        );
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(tab_spans)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border()))
-                .title(format!(" {project} · tabs ")),
-        ),
-        areas.tabs,
+        Paragraph::new("+")
+            .style(Style::default().fg(accent()).add_modifier(Modifier::BOLD))
+            .alignment(ratatui::layout::Alignment::Center),
+        tab_areas.add,
+    );
+    frame.render_widget(
+        Paragraph::new("⋯")
+            .style(Style::default().fg(muted()))
+            .alignment(ratatui::layout::Alignment::Center),
+        tab_areas.manage,
     );
 
+    let pane_inner_width = areas.panes.width.saturating_sub(2);
     let pane_items = if panes.is_empty() {
-        vec![ListItem::new(
-            "No panes in this tab — tap +Pane to start a shell",
-        )]
+        vec![ListItem::new(vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  No panes in this tab",
+                Style::default().fg(muted()),
+            )),
+            Line::from(Span::styled(
+                "  Start a shell with + PANE or restore a saved session",
+                Style::default().fg(muted()),
+            )),
+        ])]
     } else {
         panes
             .iter()
             .map(|pane| {
-                let label = pane
-                    .get("label")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?");
-                let command = pane
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?");
-                let health = pane
-                    .get("health")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("waiting");
+                let label = pane_label(pane);
                 let agent = pane
                     .get("agent_kind")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("shell");
-                let (marker, health_color) = if health == "active" {
-                    (" ● ", success())
-                } else {
-                    (" ○ ", warning())
-                };
-                let mut line = vec![
-                    Span::styled(marker, Style::default().fg(health_color)),
-                    Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
-                ];
-                if !portrait {
-                    line.push(Span::styled(
-                        format!("  {agent} · {health} · {command}"),
-                        Style::default().fg(muted()),
-                    ));
-                } else {
-                    line.push(Span::styled(
-                        format!(" · {agent} {health}"),
-                        Style::default().fg(health_color),
-                    ));
-                }
-                ListItem::new(Line::from(line))
+                let (marker, state, state_color) = pane_semantic_state(pane);
+                let reserved = 8_usize;
+                let used = marker.chars().count() + label.chars().count() + 3;
+                let spacing = " ".repeat(
+                    usize::from(pane_inner_width)
+                        .saturating_sub(used)
+                        .saturating_sub(reserved),
+                );
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(format!(" {marker} "), Style::default().fg(state_color)),
+                        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(spacing),
+                        Span::styled("  ⋯  ", Style::default().fg(muted())),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(
+                            format!("{agent} · {state}"),
+                            Style::default().fg(state_color),
+                        ),
+                    ]),
+                ])
             })
             .collect()
     };
@@ -2546,7 +3785,7 @@ fn draw_window_dashboard(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border()))
-                .title(" PANES · tap select · tap again open "),
+                .title(" PANES · tap to open "),
         )
         .highlight_style(
             Style::default()
@@ -2557,63 +3796,97 @@ fn draw_window_dashboard(
     let mut pane_state = ListState::default();
     if !panes.is_empty() {
         pane_state.select(Some(selected_pane));
+        *pane_state.offset_mut() = pane_offset;
     }
     frame.render_stateful_widget(pane_list, areas.panes, &mut pane_state);
 
-    let slot_items = slots
-        .get("slots")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(usize::from(areas.slots.height.saturating_sub(2)))
-        .map(|slot| {
-            let agent = slot
-                .get("agent_kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let name = slot
-                .get("slot_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let saved = if slot
-                .get("native_session_id")
-                .is_some_and(|id| !id.is_null())
-            {
-                "resume"
-            } else {
-                "new"
-            };
-            ListItem::new(format!(" {agent}/{name} · {saved}"))
-        })
-        .collect::<Vec<_>>();
-    if !portrait {
+    if areas.details.width > 0 {
+        let detail_lines = panes.get(selected_pane).map_or_else(
+            || {
+                vec![
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "No pane selected",
+                        Style::default().fg(muted()),
+                    )),
+                ]
+            },
+            |pane| {
+                let agent = pane
+                    .get("agent_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("shell");
+                let (_, state, state_color) = pane_semantic_state(pane);
+                let command = pane
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("shell");
+                let idle = pane
+                    .get("idle_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                vec![
+                    Line::from(Span::styled(
+                        pane_label(pane).to_owned(),
+                        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        format!("{agent} · {state}"),
+                        Style::default().fg(state_color),
+                    )),
+                    Line::raw(""),
+                    Line::from(Span::styled("COMMAND", Style::default().fg(muted()))),
+                    Line::from(command.to_owned()),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        format!("Last activity {idle}s ago"),
+                        Style::default().fg(muted()),
+                    )),
+                    Line::from(Span::styled(
+                        "Enter opens · M manages",
+                        Style::default().fg(muted()),
+                    )),
+                ]
+            },
+        );
         frame.render_widget(
-            List::new(slot_items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border()))
-                    .title(" Saved agents "),
-            ),
-            areas.slots,
+            Paragraph::new(detail_lines)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border()))
+                        .title(" PANE DETAILS "),
+                ),
+            areas.details,
         );
     }
+
     frame.render_widget(
-        Paragraph::new(" + TAB       + PANE       RESUME       MANAGE ")
-            .alignment(ratatui::layout::Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border()))
-                    .title(" Workspace controls "),
-            ),
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border())),
         areas.actions,
     );
-    let status_area = Rect {
-        x: area.x,
-        y: areas.actions.y.saturating_add(areas.actions.height),
-        width: area.width,
-        height: 1,
-    };
+    for (index, (label, action_area)) in ["+ PANE", "RESUME", "WORKSPACES"]
+        .into_iter()
+        .zip(dashboard_action_areas(areas.actions))
+        .enumerate()
+    {
+        let enabled = index != 1 || !resumable_slots.is_empty();
+        frame.render_widget(
+            Paragraph::new(label)
+                .style(if index == 0 {
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+                } else if enabled {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(muted())
+                })
+                .alignment(ratatui::layout::Alignment::Center),
+            action_area,
+        );
+    }
     frame.render_widget(
         Paragraph::new(notice)
             .style(Style::default().fg(if notice.is_empty() {
@@ -2622,10 +3895,17 @@ fn draw_window_dashboard(
                 warning()
             }))
             .wrap(Wrap { trim: true }),
-        status_area,
+        areas.notice,
     );
     if let Some(input) = input {
-        let popup = centered_rect(80, 30, area);
+        let popup = if matches!(
+            input.action,
+            DashboardAction::DeleteTab | DashboardAction::StopPane
+        ) {
+            centered_fixed(48, 7, area)
+        } else {
+            centered_fixed(44, 7, area)
+        };
         frame.render_widget(WidgetClear, popup);
         frame.render_widget(
             Paragraph::new(format!("{}\n\n{}", action_label(input.action), input.value))
@@ -2639,11 +3919,15 @@ fn draw_window_dashboard(
             popup,
         );
     } else if resume_picker_open {
-        let menu = resume_menu_rect(area);
+        let menu = resume_menu_rect(area, resumable_slots.len());
+        let (slot_offset, visible_slots) =
+            resume_menu_viewport(selected_resume, resumable_slots.len(), menu);
         frame.render_widget(WidgetClear, menu);
         let entries = resumable_slots
             .iter()
             .enumerate()
+            .skip(slot_offset)
+            .take(visible_slots)
             .map(|(index, slot)| {
                 let agent = slot
                     .get("agent_kind")
@@ -2674,7 +3958,16 @@ fn draw_window_dashboard(
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Tap a session to resume it",
+                if visible_slots < resumable_slots.len() {
+                    format!(
+                        "Sessions {}–{} of {}",
+                        slot_offset + 1,
+                        slot_offset + visible_slots,
+                        resumable_slots.len()
+                    )
+                } else {
+                    "Tap a session to resume it".to_owned()
+                },
                 Style::default().fg(muted()),
             )),
             Line::raw(""),
@@ -2682,7 +3975,7 @@ fn draw_window_dashboard(
         lines.extend(entries);
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "Esc · Back",
+            "↑↓ Navigate · Enter select · Esc back",
             Style::default().fg(muted()),
         )));
         frame.render_widget(
@@ -2691,6 +3984,37 @@ fn draw_window_dashboard(
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(accent()))
                     .title(" Resume session "),
+            ),
+            menu,
+        );
+    } else if tab_menu_open {
+        let label = tabs
+            .get(selected_tab)
+            .and_then(|tab| tab.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Tab");
+        let menu = tab_menu_rect(area);
+        frame.render_widget(WidgetClear, menu);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    label.to_owned(),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "↑↓ Navigate · Enter · Esc",
+                    Style::default().fg(muted()),
+                )),
+                Line::raw(""),
+                popup_menu_line("RENAME TAB", tab_menu_selected == 0, menu.width - 2),
+                popup_menu_line("DELETE TAB", tab_menu_selected == 1, menu.width - 2),
+                popup_menu_line("CANCEL", tab_menu_selected == 2, menu.width - 2),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(accent()))
+                    .title(" Tab menu "),
             ),
             menu,
         );
@@ -2709,21 +4033,20 @@ fn draw_window_dashboard(
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    "Choose an action",
+                    "↑↓ Navigate · Enter · Esc",
                     Style::default().fg(muted()),
                 )),
                 Line::raw(""),
-                Line::from("  RENAME"),
-                Line::from("  CLOSE PANE"),
-                Line::from("  STATUS"),
-                Line::raw(""),
-                Line::from(Span::styled("  BACK", Style::default().fg(muted()))),
+                popup_menu_line("RENAME", pane_menu_selected == 0, menu.width - 2),
+                popup_menu_line("STATUS", pane_menu_selected == 1, menu.width - 2),
+                popup_menu_line("CLOSE PANE", pane_menu_selected == 2, menu.width - 2),
+                popup_menu_line("CANCEL", pane_menu_selected == 3, menu.width - 2),
             ])
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(accent()))
-                    .title(" Pane menu · tap an option "),
+                    .title(" Pane menu "),
             ),
             menu,
         );
@@ -2887,25 +4210,6 @@ fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
     );
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(horizontal[1])[1]
-}
-
 fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(1);
     let height = height.min(area.height.saturating_sub(2)).max(1);
@@ -2918,190 +4222,11 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     )
 }
 
-/*
-fn dashboard_loop(state_dir: &PathBuf, workspace: &PathBuf) -> Result<()> {
-    let mut selected_tab = 0_usize;
-    let mut selected_pane = 0_usize;
-    let mut notice = String::new();
-    loop {
-        let status = dashboard_request(state_dir, Request::Status)?;
-        let tabs = dashboard_request(
-            state_dir,
-            Request::ListTabs {
-                cwd: Some(workspace),
-            },
-        )?;
-        let slots = dashboard_request(
-            state_dir,
-            Request::ListSlots {
-                cwd: Some(workspace),
-            },
-        )?;
-        let tab_values = tabs
-            .get("tabs")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if tab_values.is_empty() {
-            anyhow::bail!("workspace has no tabs");
-        }
-        selected_tab = selected_tab.min(tab_values.len() - 1);
-        let tab_name = tab_values[selected_tab]
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Main");
-        let panes: Vec<&serde_json::Value> = status
-            .get("pane_details")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|pane| pane.get("tab").and_then(serde_json::Value::as_str) == Some(tab_name))
-            .collect();
-        selected_pane = selected_pane.min(panes.len().saturating_sub(1));
-        let layout = render_dashboard(
-            workspace,
-            &tab_values,
-            selected_tab,
-            &panes,
-            selected_pane,
-            &slots,
-            &notice,
-        )?;
-        notice.clear();
-
-        let code = match read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => key.code,
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
-                if mouse.row == layout.tab_row {
-                    selected_tab = (usize::from(mouse.column) * tab_values.len() / layout.width)
-                        .min(tab_values.len() - 1);
-                    selected_pane = 0;
-                    continue;
-                }
-                if mouse.row >= layout.pane_start
-                    && mouse.row < layout.pane_start + panes.len().min(4) as u16
-                    && !panes.is_empty()
-                {
-                    let index = usize::from(mouse.row - layout.pane_start);
-                    let pane_id = panes[index]
-                        .get("pane_id")
-                        .and_then(serde_json::Value::as_str)
-                        .context("pane has no ID")?;
-                    disable_raw_mode()?;
-                    let mut stream = UnixStream::connect(state_dir.join("workspace.sock"))?;
-                    return attach(&mut stream, pane_id);
-                }
-                if mouse.row == layout.action_row_one {
-                    match usize::from(mouse.column) * 3 / layout.width {
-                        0 => KeyCode::Char('n'),
-                        1 => KeyCode::Char('c'),
-                        _ => KeyCode::Char('o'),
-                    }
-                } else if mouse.row == layout.action_row_two {
-                    match usize::from(mouse.column) * 3 / layout.width {
-                        0 => KeyCode::Char('s'),
-                        1 => KeyCode::Char('r'),
-                        _ => KeyCode::Char('q'),
-                    }
-                } else {
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Left | KeyCode::Char('h') => {
-                selected_tab = selected_tab.saturating_sub(1);
-                selected_pane = 0;
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                selected_tab = (selected_tab + 1).min(tab_values.len() - 1);
-                selected_pane = 0;
-            }
-            KeyCode::Up | KeyCode::Char('k') => selected_pane = selected_pane.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                selected_pane = (selected_pane + 1).min(panes.len().saturating_sub(1));
-            }
-            KeyCode::Enter if !panes.is_empty() => {
-                let pane_id = panes[selected_pane]
-                    .get("pane_id")
-                    .and_then(serde_json::Value::as_str)
-                    .context("pane has no ID")?;
-                disable_raw_mode()?;
-                let mut stream = UnixStream::connect(state_dir.join("workspace.sock"))?;
-                return attach(&mut stream, pane_id);
-            }
-            KeyCode::Char('n') => {
-                if let Some(name) = dashboard_prompt("New tab name: ")? {
-                    let response = dashboard_request(
-                        state_dir,
-                        Request::CreateTab {
-                            name: &name,
-                            cwd: Some(workspace),
-                        },
-                    )?;
-                    notice = compact_json_message(&response, "tab created");
-                }
-            }
-            KeyCode::Char('c') | KeyCode::Char('o') => {
-                let agent = if code == KeyCode::Char('c') {
-                    "claude"
-                } else {
-                    "codex"
-                };
-                if let Some(slot) = dashboard_prompt(&format!("{agent} slot: "))? {
-                    let response = dashboard_request(
-                        state_dir,
-                        Request::StartAgent {
-                            agent,
-                            slot: &slot,
-                            cwd: Some(workspace),
-                            tab: Some(tab_name),
-                        },
-                    )?;
-                    notice = compact_json_message(&response, "pane started");
-                }
-            }
-            KeyCode::Char('s') => {
-                let response = dashboard_request(
-                    state_dir,
-                    Request::StartShell {
-                        cwd: Some(workspace),
-                        tab: Some(tab_name),
-                    },
-                )?;
-                notice = compact_json_message(&response, "shell started");
-            }
-            KeyCode::Char('r') => {
-                if let Some(input) = dashboard_prompt("Resume: agent slot: ")? {
-                    let mut parts = input.split_whitespace();
-                    if let (Some(agent), Some(slot)) = (parts.next(), parts.next()) {
-                        let response = dashboard_request(
-                            state_dir,
-                            Request::ResumeAgent {
-                                agent,
-                                slot,
-                                cwd: Some(workspace),
-                                tab: Some(tab_name),
-                            },
-                        )?;
-                        notice = compact_json_message(&response, "pane resumed");
-                    } else {
-                        notice = "Use: claude primary".to_owned();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+fn workspace_removal_rect(area: Rect) -> Rect {
+    centered_fixed(54, 11, area)
 }
 
-*/
-
-fn dashboard_request(state_dir: &PathBuf, request: Request) -> Result<serde_json::Value> {
+fn dashboard_request(state_dir: &Path, request: Request) -> Result<serde_json::Value> {
     let mut stream = UnixStream::connect(state_dir.join("workspace.sock"))?;
     request_value(&mut stream, request)
 }
@@ -3186,7 +4311,7 @@ impl Drop for NotificationListener {
 }
 
 fn notification_cursor(
-    state_dir: &PathBuf,
+    state_dir: &Path,
     after_sequence: u64,
 ) -> Result<(u64, Vec<serde_json::Value>)> {
     let response = dashboard_request(state_dir, Request::ListNotifications { after_sequence })?;
@@ -3202,21 +4327,6 @@ fn notification_cursor(
     Ok((latest, notifications))
 }
 
-/*
-fn dashboard_prompt(label: &str) -> Result<Option<String>> {
-    disable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    write!(stdout, "\r\n{label}")?;
-    stdout.flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    enable_raw_mode()?;
-    let input = input.trim().to_owned();
-    Ok((!input.is_empty()).then_some(input))
-}
-
-*/
-
 fn compact_json_message(response: &serde_json::Value, fallback: &str) -> String {
     if let Some(message) = response.get("message").and_then(serde_json::Value::as_str) {
         return message.to_owned();
@@ -3226,161 +4336,6 @@ fn compact_json_message(response: &serde_json::Value, fallback: &str) -> String 
     }
     fallback.to_owned()
 }
-
-/*
-struct DashboardLayout {
-    width: usize,
-    tab_row: u16,
-    pane_start: u16,
-    action_row_one: u16,
-    action_row_two: u16,
-}
-
-fn render_dashboard(
-    workspace: &PathBuf,
-    tabs: &[serde_json::Value],
-    selected_tab: usize,
-    panes: &[&serde_json::Value],
-    selected_pane: usize,
-    slots: &serde_json::Value,
-    notice: &str,
-) -> Result<DashboardLayout> {
-    let (columns, _) = size()?;
-    // Keep one spare terminal column: writing into the last cell can trigger
-    // automatic wrapping on Termux and corrupt the next dashboard row.
-    let width = usize::from(columns).saturating_sub(1).clamp(28, 48);
-    let inner = width - 2;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-    let mut rows = Vec::new();
-    rows.push(format!(
-        "╭{}╮",
-        fit(
-            &format!(
-                " WORKSPACE · {} ",
-                workspace
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(".")
-            ),
-            inner,
-            '─'
-        )
-    ));
-    rows.push(format!(
-        "│{}│",
-        fit(" ←/→ tab · ↑/↓ pane · Enter attach ", inner, ' ')
-    ));
-    let tab_line = tabs
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            let name = tab
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            if index == selected_tab {
-                format!("[{}]", name)
-            } else {
-                name.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    rows.push(format!("├{}┤", fit(" TABS ", inner, '─')));
-    rows.push(format!("│{}│", fit(&format!(" {tab_line}"), inner, ' ')));
-    rows.push(format!("├{}┤", fit(" PANES ", inner, '─')));
-    if panes.is_empty() {
-        rows.push(format!("│{}│", fit("  (no panes in this tab)", inner, ' ')));
-    }
-    for (index, pane) in panes.iter().take(4).enumerate() {
-        let marker = if index == selected_pane { '›' } else { ' ' };
-        let command = pane
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let pane_id = pane
-            .get("pane_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        rows.push(format!(
-            "│{}│",
-            fit(
-                &format!(
-                    " {marker} ● {command} · {}",
-                    &pane_id[..pane_id.len().min(6)]
-                ),
-                inner,
-                ' '
-            )
-        ));
-    }
-    rows.push(format!("├{}┤", fit(" SLOTS ", inner, '─')));
-    for slot in slots
-        .get("slots")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(3)
-    {
-        let agent = slot
-            .get("agent_kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let name = slot
-            .get("slot_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let state = if slot
-            .get("native_session_id")
-            .is_some_and(|id| !id.is_null())
-        {
-            "resume"
-        } else {
-            "new"
-        };
-        rows.push(format!(
-            "│{}│",
-            fit(&format!("  {agent}/{name} · {state}"), inner, ' ')
-        ));
-    }
-    let pane_lines = panes.len().clamp(1, 4) as u16;
-    let slot_lines = slots
-        .get("slots")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, |items| items.len().min(3)) as u16;
-    rows.push(format!(
-        "├{}┤",
-        fit(" n TAB      c CLAUDE      o CODEX ", inner, '─')
-    ));
-    rows.push(format!(
-        "│{}│",
-        fit(" s SHELL    r RESUME      q QUIT ", inner, ' ')
-    ));
-    rows.push(format!("│{}│", fit(&format!(" {notice}"), inner, ' ')));
-    rows.push(format!("╰{}╯", "─".repeat(inner)));
-    write!(stdout, "\r{}", rows.join("\r\n"))?;
-    stdout.flush()?;
-    Ok(DashboardLayout {
-        width,
-        tab_row: 3,
-        pane_start: 5,
-        action_row_one: 6 + pane_lines + slot_lines,
-        action_row_two: 7 + pane_lines + slot_lines,
-    })
-}
-
-fn fit(value: &str, width: usize, fill: char) -> String {
-    let mut output: String = value.chars().take(width).collect();
-    output.push_str(
-        &fill
-            .to_string()
-            .repeat(width.saturating_sub(output.chars().count())),
-    );
-    output
-}
-
-*/
 
 fn logs(stream: &mut UnixStream, pane_id: &str) -> Result<()> {
     serde_json::to_writer(
@@ -3502,6 +4457,7 @@ fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use serde_json::json;
 
     fn rendered_masthead(width: u16) -> String {
         let height = workspace_masthead_height(width);
@@ -3537,6 +4493,298 @@ mod tests {
         assert_eq!(workspace_masthead_height(48), 9);
         assert_eq!(workspace_masthead_height(47), 13);
         assert_eq!(workspace_masthead_height(36), 15);
+    }
+
+    fn rendered_workspace_dashboard(width: u16, height: u16) -> String {
+        let tabs = vec![json!({ "name": "Main" }), json!({ "name": "Research" })];
+        let panes = vec![
+            json!({
+                "pane_id": "pane-2",
+                "label": "Pane 2",
+                "agent_kind": "codex",
+                "agent_state": "working",
+                "health": "active",
+                "command": "codex",
+                "idle_seconds": 3
+            }),
+            json!({
+                "pane_id": "pane-10",
+                "label": "Pane 10",
+                "agent_kind": "claude",
+                "agent_state": "attention",
+                "health": "active",
+                "command": "claude",
+                "idle_seconds": 12
+            }),
+        ];
+        let resumable = vec![json!({ "agent_kind": "claude" })];
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_window_dashboard(
+                    frame,
+                    frame.area(),
+                    DashboardView {
+                        tabs: &tabs,
+                        selected_tab: 0,
+                        panes: &panes,
+                        selected_pane: 0,
+                        pane_offset: 0,
+                        notice: "ready",
+                        input: None,
+                        manage_open: false,
+                        pane_menu_selected: 0,
+                        tab_menu_open: false,
+                        tab_menu_selected: 0,
+                        resume_picker_open: false,
+                        resumable_slots: &resumable,
+                        selected_resume: 0,
+                        workspace: Path::new("/test/my-app"),
+                    },
+                )
+            })
+            .expect("draw dashboard");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn workspace_dashboard_uses_the_full_screen_and_reflows_details() {
+        let portrait = Rect::new(0, 0, 48, 28);
+        let portrait_areas = window_areas(dashboard_rect(portrait));
+        assert_eq!(dashboard_rect(portrait), portrait);
+        assert_eq!(portrait_areas.details.width, 0);
+        assert_eq!(portrait_areas.identity.y, 0);
+        assert_eq!(portrait_areas.notice.bottom(), portrait.bottom());
+
+        let landscape = Rect::new(0, 0, 100, 28);
+        let landscape_areas = window_areas(dashboard_rect(landscape));
+        assert!(landscape_areas.details.width > 0);
+        assert_eq!(landscape_areas.panes.x, 0);
+        assert_eq!(landscape_areas.details.right(), landscape.right());
+    }
+
+    #[test]
+    fn workspace_removal_confirmation_stays_compact_in_portrait() {
+        let portrait = Rect::new(0, 0, 48, 40);
+        let dialog = workspace_removal_rect(portrait);
+        assert_eq!((dialog.width, dialog.height), (46, 11));
+        assert!(dialog.height < portrait.height / 2);
+        assert_eq!(dialog.bottom().saturating_sub(2), dialog.y + 9);
+
+        let landscape = Rect::new(0, 0, 100, 28);
+        let dialog = workspace_removal_rect(landscape);
+        assert_eq!((dialog.width, dialog.height), (54, 11));
+    }
+
+    #[test]
+    fn workspace_dashboard_renders_touch_targets_in_portrait_and_landscape() {
+        for (width, height) in [(48, 28), (100, 28)] {
+            let rendered = rendered_workspace_dashboard(width, height);
+            assert!(rendered.contains("▪ ▪ ▪"));
+            assert!(rendered.contains("MY-APP"));
+            assert!(rendered.contains("TABS"));
+            assert!(rendered.contains("Pane 2"));
+            assert!(rendered.contains("codex · working"));
+            assert!(rendered.contains("+ PANE"));
+            assert!(rendered.contains("RESUME"));
+            assert!(rendered.contains("WORKSPACES"));
+        }
+        assert!(rendered_workspace_dashboard(100, 28).contains("PANE DETAILS"));
+        assert!(!rendered_workspace_dashboard(48, 28).contains("PANE DETAILS"));
+    }
+
+    #[test]
+    fn dashboard_hit_areas_and_touch_scroll_are_bounded() {
+        let screen = Rect::new(0, 0, 48, 28);
+        let tab_menu = tab_menu_rect(screen);
+        let pane_menu = pane_menu_rect(screen);
+        let one_session = resume_menu_rect(screen, 1);
+        let many_sessions = resume_menu_rect(screen, 20);
+        assert_eq!((tab_menu.width, tab_menu.height), (38, 8));
+        assert_eq!((pane_menu.width, pane_menu.height), (40, 9));
+        assert_eq!((one_session.width, one_session.height), (44, 8));
+        assert_eq!((many_sessions.width, many_sessions.height), (44, 12));
+        assert!(many_sessions.height < screen.height / 2);
+        assert!(contains(tab_menu, tab_menu.x + 1, tab_menu.y + 4));
+        assert!(!contains(tab_menu, tab_menu.x - 1, tab_menu.y + 4));
+
+        assert_eq!(resume_menu_viewport(0, 10, many_sessions), (0, 5));
+        assert_eq!(resume_menu_viewport(7, 10, many_sessions), (3, 5));
+        assert_eq!(resume_menu_viewport(9, 10, many_sessions), (5, 5));
+
+        let tabs = dashboard_tab_areas(Rect::new(0, 4, 48, 3), 3, 1);
+        assert!(tabs.compact);
+        assert!(!contains(tabs.previous, tabs.add.x, tabs.add.y));
+        assert!(!contains(tabs.next, tabs.manage.x, tabs.manage.y));
+
+        let actions = dashboard_action_areas(Rect::new(0, 25, 48, 3));
+        assert!(actions[0].right() <= actions[1].x);
+        assert!(actions[1].right() <= actions[2].x);
+
+        assert_eq!(scrolled_pane_selection(0, 3, true), 0);
+        assert_eq!(scrolled_pane_selection(0, 3, false), 1);
+        assert_eq!(scrolled_pane_selection(2, 3, false), 2);
+        assert_eq!(scrolled_pane_selection(0, 0, false), 0);
+    }
+
+    #[test]
+    fn long_tab_names_are_truncated_for_display_only() {
+        assert_eq!(
+            truncate_display_label("Research and planning", 10),
+            "Research …"
+        );
+        assert_eq!(truncate_display_label("界面设计工作区", 7), "界面设…");
+        assert_eq!(truncate_display_label("Main", 10), "Main");
+        assert_eq!(truncate_display_label("Main", 1), "…");
+        assert_eq!(truncate_display_label("Main", 0), "");
+    }
+
+    fn test_pane(id: &str, label: &str) -> PaneDescriptor {
+        PaneDescriptor {
+            pane_id: id.to_owned(),
+            label: label.to_owned(),
+            agent: "claude".to_owned(),
+            state: "working".to_owned(),
+            tab: "Main".to_owned(),
+            workspace_root: "/test/my-app".to_owned(),
+            resume_command: None,
+        }
+    }
+
+    #[test]
+    fn attached_pane_layout_preserves_portrait_width_and_adds_a_wide_rail() {
+        for area in [
+            Rect::new(0, 0, 40, 30),
+            Rect::new(0, 0, 48, 30),
+            Rect::new(0, 0, 86, 24),
+        ] {
+            let layout = pane_layout(area);
+            assert_eq!(layout.header.height, 2);
+            assert_eq!(layout.terminal.width, area.width);
+            assert_eq!(layout.terminal.height, area.height - 2);
+            assert_eq!(layout.rail.width, 0);
+        }
+
+        let layout = pane_layout(Rect::new(0, 0, 100, 28));
+        assert_eq!(layout.terminal.width, 75);
+        assert_eq!(layout.rail.width, 25);
+        assert_eq!(layout.terminal.right(), layout.rail.x);
+        assert_eq!(layout.rail.right(), 100);
+
+        let layout = pane_layout(Rect::new(0, 0, 120, 32));
+        assert_eq!(layout.terminal.width, 90);
+        assert_eq!(layout.rail.width, 30);
+
+        for width in [24, 40, 48, 100] {
+            let header = Rect::new(0, 0, width, 2);
+            let areas = pane_header_areas(header);
+            assert_eq!(areas.workspace.x, header.x);
+            assert_eq!(areas.workspace.right(), areas.action.x);
+            assert_eq!(areas.action.right(), header.right());
+            assert_eq!(areas.status.x, header.x);
+            assert_eq!(areas.status.width, header.width);
+            assert_eq!(areas.status.y, header.y + 1);
+        }
+
+        let mut pane = test_pane("one", "Pane 1");
+        pane.state = "unknown".to_owned();
+        assert_eq!(pane_header_status(&pane, false, 0), "Pane 1 · claude");
+        assert_eq!(
+            pane_header_status(&pane, false, 54),
+            "HISTORY · 54 lines up"
+        );
+
+        let offline_action = offline_pane_action_rect(Rect::new(0, 0, 48, 30));
+        let offline = offline_pane_rect(Rect::new(0, 0, 48, 30));
+        assert!(contains(offline, offline_action.x, offline_action.y));
+        assert_eq!(offline_action.y, offline.bottom() - 2);
+    }
+
+    #[test]
+    fn attached_pane_roster_cycles_every_pane_and_menus_stay_compact() {
+        let roster = vec![
+            test_pane("one", "Pane 1"),
+            test_pane("two", "Pane 2"),
+            test_pane("three", "Pane 3"),
+        ];
+        assert_eq!(next_pane_id(&roster, "one").as_deref(), Some("two"));
+        assert_eq!(next_pane_id(&roster, "two").as_deref(), Some("three"));
+        assert_eq!(next_pane_id(&roster, "three").as_deref(), Some("one"));
+        assert_eq!(next_pane_id(&roster[..1], "one"), None);
+
+        let screen = Rect::new(0, 0, 48, 30);
+        let menu = pane_overlay_rect(screen, &PaneOverlay::Menu { selected: 0 }, roster.len());
+        assert_eq!((menu.width, menu.height), (44, 11));
+        let switch = pane_overlay_rect(screen, &PaneOverlay::Switch { selected: 0 }, roster.len());
+        assert_eq!((switch.width, switch.height), (44, 7));
+        assert!(menu.height < screen.height / 2);
+    }
+
+    #[test]
+    fn modal_menus_ignore_letters_and_accept_only_explicit_navigation() {
+        for character in ['b', 'r', 'd', 's', 'j', 'k', 'x'] {
+            assert_eq!(
+                modal_navigation(&KeyCode::Char(character)),
+                ModalNavigation::Ignore
+            );
+        }
+        assert_eq!(modal_navigation(&KeyCode::Esc), ModalNavigation::Cancel);
+        assert_eq!(modal_navigation(&KeyCode::Up), ModalNavigation::Previous);
+        assert_eq!(modal_navigation(&KeyCode::Down), ModalNavigation::Next);
+        assert_eq!(modal_navigation(&KeyCode::Enter), ModalNavigation::Confirm);
+
+        let (acknowledged_tx, acknowledged_rx) = mpsc::channel();
+        let touch = PaneMouseInput {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 47,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            acknowledged: Some(acknowledged_tx),
+        };
+        drop(touch);
+        assert!(
+            acknowledged_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_ok(),
+            "dropping a routed touch must unblock the input pump"
+        );
+
+        let mut terminal = workspace_terminal::Terminal::new(2, 8);
+        terminal.process(b"prompt");
+        let mut prior_screen = Some(terminal.snapshot());
+        let mut retained_frame = Some(Buffer::empty(Rect::new(0, 0, 8, 2)));
+        invalidate_pane_frame(&mut retained_frame, &mut prior_screen);
+        assert!(retained_frame.is_none());
+        assert!(prior_screen.is_none());
+    }
+
+    #[test]
+    fn panes_sort_naturally_and_keep_the_selected_identity() {
+        let mut panes = vec![
+            json!({ "pane_id": "ten", "label": "Pane 10" }),
+            json!({ "pane_id": "custom", "label": "Research" }),
+            json!({ "pane_id": "two", "label": "Pane 2" }),
+            json!({ "pane_id": "one", "label": "Pane 1" }),
+        ];
+        panes.sort_by_key(pane_order_key);
+        assert_eq!(
+            panes.iter().map(pane_label).collect::<Vec<_>>(),
+            vec!["Pane 1", "Pane 2", "Pane 10", "Research"]
+        );
+
+        let mut selected = HashMap::new();
+        remember_selected_pane(&mut selected, "Main", &panes, 1);
+        assert_eq!(selected.get("Main").map(String::as_str), Some("two"));
     }
 
     #[test]
