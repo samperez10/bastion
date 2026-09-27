@@ -780,7 +780,7 @@ fn executable_file(path: &std::path::Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn find_command(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_command(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())

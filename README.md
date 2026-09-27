@@ -17,7 +17,7 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 ## Requirements
 
 - Termux on an ARM64 Android device; the initial release target is Android API 26 or newer.
-- `curl`, `tar`, and `coreutils` for verified release installation and updates.
+- `curl`, `tar`, `sed`, and `coreutils` for verified release installation and updates. The installer can add missing Termux packages for you.
 - `git`, `rust`, and `clang` when building from source.
 - Claude, Codex, or Antigravity only when using that agent's integration. Ordinary shells work without an AI CLI.
 
@@ -31,7 +31,17 @@ Install the latest ARM64 Termux release:
 curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | sh
 ```
 
-The installer checks the Termux environment, architecture, tools, writable install path, available storage, and GitHub connectivity before activation. It verifies the release checksum before replacing any executable. Supported agent CLIs already on the device are integrated automatically; agents installed later are detected on the next Bastion launch. Set `BASTION_SKIP_INTEGRATIONS=1` to skip integration during installation.
+The installer checks the Termux environment, architecture, tools, writable install path, available storage, and GitHub connectivity before activation. Missing runtime packages are shown together and can be installed after one confirmation; AI agent CLIs are never installed automatically. It verifies the release checksum before replacing any executable. Supported agent CLIs already on the device are integrated automatically; agents installed later are detected on the next Bastion launch.
+
+The installer detects an existing Bastion installation. It repairs integrations without downloading the same version, upgrades older releases, and refuses accidental downgrades. Useful automation controls are:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | BASTION_INSTALL_DEPS=1 sh
+curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | BASTION_INSTALL_DEPS=0 sh
+curl -fsSL https://raw.githubusercontent.com/samperez10/bastion/main/install.sh | BASTION_FORCE_INSTALL=1 sh
+```
+
+Set `BASTION_SKIP_INTEGRATIONS=1` to skip integration during installation. Set `BASTION_ALLOW_DOWNGRADE=1` only when intentionally installing an older release with `BASTION_VERSION`.
 
 To build from source instead:
 
@@ -103,11 +113,12 @@ The same controls are available from the command line:
 bastion update check
 bastion update status
 bastion update install
+bastion update install --yes
 bastion update rollback
 bastion update skip
 ```
 
-Update checks fail safely when offline and never prevent Bastion from opening existing workspaces. `bastion update rollback` uses the local verified backup; it does not require GitHub or a network connection.
+Update checks fail safely when offline and never prevent Bastion from opening existing workspaces. If an update dependency is missing, `bastion update install` offers to install its Termux package first; `--yes` approves both that step and the update. `bastion update rollback` uses the local verified backup; it does not require GitHub or a network connection.
 
 ## Development
 

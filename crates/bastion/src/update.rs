@@ -1,4 +1,4 @@
-use crate::{UpdateCommand, daemon_status, start_daemon, stop_daemon};
+use crate::{UpdateCommand, daemon_status, find_command, start_daemon, stop_daemon};
 use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,14 @@ const BINARIES: [&str; 4] = [
     "termux-tui",
     "workspace-agent",
 ];
+const UPDATE_DEPENDENCIES: [(&str, &str); 3] =
+    [("curl", "curl"), ("tar", "tar"), ("sha256sum", "coreutils")];
+
+#[derive(Debug, PartialEq, Eq)]
+struct DependencyPlan {
+    commands: Vec<&'static str>,
+    packages: Vec<&'static str>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -321,6 +329,7 @@ fn fetch_release() -> Result<Release> {
 
 fn install(state_dir: &Path, yes: bool) -> Result<()> {
     ensure_installed_layout()?;
+    ensure_update_dependencies(yes)?;
     let _lock = UpdateLock::acquire(state_dir)?;
     let cache = check(state_dir, true).context(
         "Could not reach GitHub to check for updates. Bastion was not changed; try again when connected",
@@ -340,6 +349,73 @@ fn install(state_dir: &Path, yes: bool) -> Result<()> {
     let staging = StagingDir::create(state_dir)?;
     fs::create_dir_all(staging.path.join("payload"))?;
     install_from_release(state_dir, &staging.path, &release)
+}
+
+fn dependency_plan(mut available: impl FnMut(&str) -> bool) -> DependencyPlan {
+    let mut commands = Vec::new();
+    let mut packages = Vec::new();
+    for (command, package) in UPDATE_DEPENDENCIES {
+        if available(command) {
+            continue;
+        }
+        commands.push(command);
+        if !packages.contains(&package) {
+            packages.push(package);
+        }
+    }
+    DependencyPlan { commands, packages }
+}
+
+fn ensure_update_dependencies(yes: bool) -> Result<()> {
+    let plan = dependency_plan(|command| find_command(command).is_some());
+    if plan.commands.is_empty() {
+        return Ok(());
+    }
+    let packages = plan.packages.join(" ");
+    println!("Bastion needs these Termux packages: {packages}");
+    println!("Missing commands: {}", plan.commands.join(" "));
+
+    let approved = if yes {
+        true
+    } else if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        print!("Install required packages now? [Y/n] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
+    } else {
+        false
+    };
+    if !approved {
+        anyhow::bail!("required packages are missing; run: pkg install {packages}");
+    }
+
+    let package_manager = find_command("pkg").context(format!(
+        "Termux package manager not found; run: pkg install {packages}"
+    ))?;
+    println!("Installing required packages…");
+    let status = Command::new(package_manager)
+        .arg("install")
+        .arg("-y")
+        .args(&plan.packages)
+        .status()
+        .context("install required Termux packages")?;
+    if !status.success() {
+        anyhow::bail!("could not install required packages; run: pkg install {packages}");
+    }
+
+    let remaining = dependency_plan(|command| find_command(command).is_some());
+    if !remaining.commands.is_empty() {
+        anyhow::bail!(
+            "packages installed, but commands are still missing: {}",
+            remaining.commands.join(" ")
+        );
+    }
+    println!("✓ Required packages installed");
+    Ok(())
 }
 
 fn install_from_release(state_dir: &Path, staging: &Path, release: &Release) -> Result<()> {
@@ -986,10 +1062,21 @@ mod tests {
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.17"));
+        assert!(is_newer("0.1.0-alpha.18"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.16"));
+        assert!(!is_newer("0.1.0-alpha.17"));
         assert!(!is_newer("not-a-version"));
+    }
+
+    #[test]
+    fn dependency_plan_deduplicates_termux_packages() {
+        let plan = dependency_plan(|command| command == "tar");
+        assert_eq!(plan.commands, vec!["curl", "sha256sum"]);
+        assert_eq!(plan.packages, vec!["curl", "coreutils"]);
+
+        let complete = dependency_plan(|_| true);
+        assert!(complete.commands.is_empty());
+        assert!(complete.packages.is_empty());
     }
 
     #[test]
