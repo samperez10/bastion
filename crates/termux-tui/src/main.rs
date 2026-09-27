@@ -633,15 +633,16 @@ fn pick_workspace(
         }
         available_update = refreshed_update;
         terminal.draw(|frame| {
+            let masthead_height = workspace_masthead_height(frame.area().width);
             let areas = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(10),
+                    Constraint::Length(masthead_height),
                     Constraint::Min(5),
                     Constraint::Length(2),
                 ])
                 .split(frame.area());
-            frame.render_widget(workspace_masthead(), areas[0]);
+            render_workspace_masthead(frame, areas[0]);
             let items = workspaces
                 .iter()
                 .map(|workspace| {
@@ -1012,7 +1013,7 @@ fn pick_workspace(
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && !removing
-                    && mouse.row >= 11 =>
+                    && mouse.row >= workspace_first_item_row(terminal.size()?.width) =>
             {
                 let size = terminal.size()?;
                 if mouse.row >= size.height.saturating_sub(2) {
@@ -1030,9 +1031,8 @@ fn pick_workspace(
                     }
                     continue;
                 }
-                // Row 10 is the workspace-list border; rows from 11 carry
-                // list items below the MOTD-style masthead.
-                let index = usize::from(mouse.row.saturating_sub(11));
+                let first_item_row = workspace_first_item_row(size.width);
+                let index = usize::from(mouse.row.saturating_sub(first_item_row));
                 if index < workspaces.len() {
                     let root = workspaces[index]
                         .get("canonical_root")
@@ -2730,51 +2730,161 @@ fn draw_window_dashboard(
     }
 }
 
-/// The workspace selector uses the established Termux MOTD as fixed Bastion
-/// branding. Workspace-specific details belong in the selectable list below.
-fn workspace_masthead() -> Paragraph<'static> {
-    Paragraph::new(vec![
-        Line::from(Span::styled(
-            "  ▪ ▪ ▪                        B A S T I O N  ",
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  ▄█████▄    ", Style::default().fg(accent())),
+const MASTHEAD_DESCRIPTION: &str = "Persistent workspaces for AI agents";
+const MASTHEAD_PROMISE: &str = "ONE COMMAND CENTER FOR EVERY AGENT";
+
+fn workspace_masthead_height(width: u16) -> u16 {
+    if width >= 48 {
+        9
+    } else if width >= 40 {
+        13
+    } else {
+        15
+    }
+}
+
+fn workspace_first_item_row(width: u16) -> u16 {
+    workspace_masthead_height(width).saturating_add(1)
+}
+
+/// Render Bastion's fixed identity at full terminal width. Wide screens keep
+/// the gate mark beside the copy; portrait widths reflow the complete mark
+/// above complete, unabridged text rather than cropping either one.
+fn render_workspace_masthead(frame: &mut ratatui::Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border()));
+    frame.render_widget(block, area);
+    if area.width < 3 || area.height < 4 {
+        return;
+    }
+
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let left = "  ▪ ▪ ▪";
+    let right = "B A S T I O N  ";
+    let spacing = " ".repeat(
+        usize::from(inner.width)
+            .saturating_sub(left.chars().count())
+            .saturating_sub(right.chars().count()),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
-                "╭─────────────────────────────╮",
-                Style::default().fg(border()),
+                left,
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(" ▐██▀█▀██▌   ", Style::default().fg(accent())),
+            Span::raw(spacing),
             Span::styled(
-                "│  >_  CODE · BUILD · DEPLOY  │",
-                Style::default().fg(Color::White),
+                right,
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ▀█▀ ▀█▀    ", Style::default().fg(accent())),
-            Span::styled(
-                "╰─────────────────────────────╯",
-                Style::default().fg(border()),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let separator = format!(
+        "├{}┤",
+        "─".repeat(usize::from(area.width.saturating_sub(2)))
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(separator, Style::default().fg(border()))),
+        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+    );
+
+    if area.width >= 48 {
+        let gap = 2_u16;
+        let logo_width = inner
+            .width
+            .saturating_sub(gap)
+            .saturating_sub(MASTHEAD_DESCRIPTION.chars().count() as u16)
+            .clamp(6, 18);
+        let copy_x = inner.x.saturating_add(logo_width).saturating_add(gap);
+        let copy_width = inner.width.saturating_sub(logo_width).saturating_sub(gap);
+        for (offset, (mark, copy)) in [
+            ("▟█▙▟█▙", ">_ CODE · BUILD · DEPLOY"),
+            ("██████", MASTHEAD_DESCRIPTION),
+            ("██▛▜██", MASTHEAD_PROMISE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            frame.render_widget(
+                Paragraph::new(Line::styled(mark, Style::default().fg(accent())))
+                    .alignment(ratatui::layout::Alignment::Center),
+                Rect::new(
+                    inner.x,
+                    area.y.saturating_add(4 + offset as u16),
+                    logo_width,
+                    1,
+                ),
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled(copy, Style::default().fg(Color::White))),
+                Rect::new(
+                    copy_x,
+                    area.y.saturating_add(4 + offset as u16),
+                    copy_width,
+                    1,
+                ),
+            );
+        }
+        return;
+    }
+
+    for (offset, mark) in ["▟█▙▟█▙", "██████", "██▛▜██"].into_iter().enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(Line::styled(mark, Style::default().fg(accent())))
+                .alignment(ratatui::layout::Alignment::Center),
+            Rect::new(
+                inner.x,
+                area.y.saturating_add(4 + offset as u16),
+                inner.width,
+                1,
             ),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "─ WORKSPACES ─────────────────────── TERMUX ──",
-            Style::default().fg(border()),
-        )),
-        Line::from(Span::styled(
-            "  Select a project to continue",
+        );
+    }
+
+    let text_width = inner.width.saturating_sub(2);
+    let text_x = inner.x.saturating_add(1);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            ">_ CODE · BUILD · DEPLOY",
             Style::default().fg(Color::White),
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border())),
-    )
+        ))
+        .alignment(ratatui::layout::Alignment::Center),
+        Rect::new(text_x, area.y.saturating_add(8), text_width, 1),
+    );
+    let wrapped = area.width < 40;
+    let copy_height = if wrapped { 2 } else { 1 };
+    frame.render_widget(
+        Paragraph::new(MASTHEAD_DESCRIPTION)
+            .style(Style::default().fg(Color::White))
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        Rect::new(text_x, area.y.saturating_add(9), text_width, copy_height),
+    );
+    frame.render_widget(
+        Paragraph::new(MASTHEAD_PROMISE)
+            .style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        Rect::new(
+            text_x,
+            area.y.saturating_add(9 + copy_height),
+            text_width,
+            copy_height,
+        ),
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -3391,6 +3501,43 @@ fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn rendered_masthead(width: u16) -> String {
+        let height = workspace_masthead_height(width);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_workspace_masthead(frame, frame.area()))
+            .expect("draw masthead");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn workspace_masthead_reflows_without_shortening_its_identity() {
+        for width in [48, 80] {
+            let rendered = rendered_masthead(width);
+            assert!(rendered.contains("▪ ▪ ▪"));
+            assert!(rendered.contains("B A S T I O N"));
+            assert!(rendered.contains("▟█▙▟█▙"));
+            assert!(rendered.contains("██████"));
+            assert!(rendered.contains("██▛▜██"));
+            assert!(rendered.contains("CODE · BUILD · DEPLOY"));
+            assert!(rendered.contains(MASTHEAD_DESCRIPTION));
+            assert!(rendered.contains(MASTHEAD_PROMISE));
+        }
+        assert_eq!(workspace_masthead_height(80), 9);
+        assert_eq!(workspace_masthead_height(48), 9);
+        assert_eq!(workspace_masthead_height(47), 13);
+        assert_eq!(workspace_masthead_height(36), 15);
+    }
 
     #[test]
     fn dirty_rows_include_the_old_and_new_cursor_rows() {
