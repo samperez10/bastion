@@ -5,8 +5,7 @@ use std::{
     fs,
     io::{IsTerminal, Read, Write},
     net::Shutdown,
-    os::unix::fs::PermissionsExt,
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     thread,
@@ -904,7 +903,8 @@ fn ensure_daemon(state_dir: &Path, workspace: &Path) -> Result<()> {
 fn start_daemon(state_dir: &Path, workspace: &Path) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("create state directory {}", state_dir.display()))?;
-    ProcessCommand::new(sibling_binary("workspace-daemon"))
+    let mut command = ProcessCommand::new(sibling_binary("workspace-daemon"));
+    command
         .args([
             "--state-dir",
             state_dir.to_string_lossy().as_ref(),
@@ -913,9 +913,20 @@ fn start_daemon(state_dir: &Path, workspace: &Path) -> Result<()> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("start Bastion daemon")?;
+        .stderr(Stdio::null());
+    // The daemon must outlive the short launcher command and its controlling
+    // Termux terminal. `setsid` prevents a terminal hangup from killing the
+    // restored panes immediately after `bastion` exits.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().context("start Bastion daemon")?;
     for _ in 0..30 {
         thread::sleep(Duration::from_millis(100));
         if daemon_status(state_dir).is_some() {
