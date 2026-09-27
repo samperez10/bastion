@@ -346,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn retains_standard_bright_dim_and_indexed_colors() {
+        let mut terminal = Terminal::new(2, 8);
+        terminal.process(b"\x1b[31mR\x1b[91mB\x1b[2;34mD\x1b[38;5;123mI");
+        let cells = &terminal.snapshot().cells[0];
+
+        assert_eq!(cells[0].foreground, super::CellColor::Named(1));
+        assert_eq!(cells[1].foreground, super::CellColor::Named(9));
+        assert_eq!(cells[2].foreground, super::CellColor::Named(4));
+        assert_eq!(cells[3].foreground, super::CellColor::Indexed(123));
+    }
+
+    #[test]
     fn exposes_requested_input_modes() {
         let mut terminal = Terminal::new(2, 8);
         terminal.process(b"\x1b[?1h\x1b[?2004h");

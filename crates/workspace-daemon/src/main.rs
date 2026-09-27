@@ -1136,7 +1136,7 @@ fn spawn_pane(
     let mut command = CommandBuilder::new(executable);
     command.args(arguments);
     command.cwd(&cwd);
-    command.env("TERM", "xterm-256color");
+    configure_terminal_environment(&mut command);
     // Global agent hooks should only report sessions started inside Bastion.
     // This prevents a separate, ordinary `codex`/`claude` invocation from
     // colliding with a managed pane's default slot.
@@ -1488,6 +1488,18 @@ fn attach(
     }
 }
 
+/// Give every managed PTY stable color capabilities regardless of how the
+/// long-lived daemon was launched. In particular, coding agents often start
+/// Bastion from environments that set `NO_COLOR=1` and `TERM=dumb`; allowing
+/// those launcher-only values to leak into later panes makes otherwise
+/// colorful interactive applications render in monochrome.
+fn configure_terminal_environment(command: &mut CommandBuilder) {
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("CLICOLOR", "1");
+    command.env_remove("NO_COLOR");
+}
+
 fn read_line(stream: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
@@ -1519,7 +1531,10 @@ fn write_response(stream: &mut UnixStream, response: Response) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{logical_slot_for_report, lowest_available_pane_label};
+    use super::{
+        configure_terminal_environment, logical_slot_for_report, lowest_available_pane_label,
+    };
+    use portable_pty::CommandBuilder;
 
     #[test]
     fn pane_numbering_uses_the_lowest_available_number() {
@@ -1545,5 +1560,29 @@ mod tests {
             logical_slot_for_report(&tracked, "codex", "pane-unique-token"),
             "pane-unique-token"
         );
+    }
+
+    #[test]
+    fn managed_panes_get_color_capabilities_even_from_a_monochrome_launcher() {
+        let mut command = CommandBuilder::new("sh");
+        command.env("TERM", "dumb");
+        command.env("COLORTERM", "");
+        command.env("NO_COLOR", "1");
+
+        configure_terminal_environment(&mut command);
+
+        assert_eq!(
+            command.get_env("TERM").and_then(|v| v.to_str()),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            command.get_env("COLORTERM").and_then(|v| v.to_str()),
+            Some("truecolor")
+        );
+        assert_eq!(
+            command.get_env("CLICOLOR").and_then(|v| v.to_str()),
+            Some("1")
+        );
+        assert_eq!(command.get_env("NO_COLOR"), None);
     }
 }

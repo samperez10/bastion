@@ -986,9 +986,9 @@ mod tests {
 
     #[test]
     fn compares_stable_and_prerelease_versions() {
-        assert!(is_newer("0.1.0-alpha.14"));
+        assert!(is_newer("0.1.0-alpha.15"));
         assert!(is_newer("0.1.0"));
-        assert!(!is_newer("0.1.0-alpha.13"));
+        assert!(!is_newer("0.1.0-alpha.14"));
         assert!(!is_newer("not-a-version"));
     }
 
