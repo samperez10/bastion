@@ -119,6 +119,14 @@ struct Pane {
     tracking_slot: Option<String>,
     tab: Mutex<String>,
     agent_state: Mutex<AgentState>,
+    agent_slot_key: Option<AgentSlotKey>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AgentSlotKey {
+    project_id: i64,
+    agent: String,
+    slot: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -160,6 +168,53 @@ struct Daemon {
     recent: Mutex<VecDeque<RecentPane>>,
     notifications: Mutex<VecDeque<AgentNotification>>,
     next_notification_sequence: Mutex<u64>,
+    agent_slot_claims: Mutex<std::collections::HashSet<AgentSlotKey>>,
+}
+
+struct AgentSlotReservation<'a> {
+    daemon: &'a Daemon,
+    key: Option<AgentSlotKey>,
+}
+
+impl<'a> AgentSlotReservation<'a> {
+    fn acquire(daemon: &'a Daemon, key: AgentSlotKey) -> Result<Self> {
+        let inserted = daemon.agent_slot_claims.lock().unwrap().insert(key.clone());
+        if !inserted {
+            let active = daemon
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, pane)| pane.agent_slot_key.as_ref() == Some(&key))
+                .map(|(pane_id, pane)| (pane_id.clone(), pane.label.lock().unwrap().clone()));
+            if let Some((pane_id, label)) = active {
+                anyhow::bail!(
+                    "{}/{} is already running in {label} ({pane_id})",
+                    key.agent,
+                    key.slot
+                );
+            }
+            anyhow::bail!("{}/{} is already starting", key.agent, key.slot);
+        }
+        Ok(Self {
+            daemon,
+            key: Some(key),
+        })
+    }
+
+    fn commit(mut self) -> AgentSlotKey {
+        self.key
+            .take()
+            .expect("an uncommitted reservation always owns its key")
+    }
+}
+
+impl Drop for AgentSlotReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            self.daemon.agent_slot_claims.lock().unwrap().remove(key);
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -201,6 +256,7 @@ fn main() -> Result<()> {
         recent: Mutex::new(VecDeque::new()),
         notifications: Mutex::new(VecDeque::new()),
         next_notification_sequence: Mutex::new(1),
+        agent_slot_claims: Mutex::new(std::collections::HashSet::new()),
     });
     if let Err(error) = restore_saved_agents(&daemon) {
         eprintln!("agent restore skipped: {error:#}");
@@ -420,10 +476,16 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                     daemon.database.lock().unwrap().ensure_project(&cwd)?
                 }
             };
+            let logical_slot = owner
+                .as_ref()
+                .map(|pane| {
+                    logical_slot_for_report(&pane.agent_slots.lock().unwrap(), &agent, &slot)
+                })
+                .unwrap_or_else(|| slot.clone());
             let agent_slot = daemon.database.lock().unwrap().record_agent_session(
                 &project,
                 &agent,
-                &slot,
+                &logical_slot,
                 &session_id,
             )?;
             // A normal +Pane shell carries a unique tracking slot. Link this
@@ -431,17 +493,18 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
             // resumable session.
             if let Some(pane) = owner {
                 let tab = pane.tab.lock().unwrap().clone();
-                daemon
-                    .database
-                    .lock()
-                    .unwrap()
-                    .set_slot_tab(&project, &agent, &slot, &tab)?;
+                daemon.database.lock().unwrap().set_slot_tab(
+                    &project,
+                    &agent,
+                    &logical_slot,
+                    &tab,
+                )?;
                 let mut tracked = pane.agent_slots.lock().unwrap();
                 if !tracked
                     .iter()
-                    .any(|item| item == &(agent.clone(), slot.clone()))
+                    .any(|item| item == &(agent.clone(), logical_slot.clone()))
                 {
-                    tracked.push((agent.clone(), slot.clone()));
+                    tracked.push((agent.clone(), logical_slot));
                 }
             }
             write_response(&mut stream, Response::Recorded { slot: agent_slot })
@@ -783,7 +846,13 @@ fn start_shell(daemon: &Arc<Daemon>, cwd: PathBuf, tab: Option<&str>) -> Result<
     )?;
     // Adapter-specific observers may discover a session the user starts from
     // an ordinary shell. The generic pane manager does not inspect agents.
-    watch_codex_session(Arc::clone(daemon), cwd, tracking_slot, started_at);
+    watch_codex_session(
+        Arc::clone(daemon),
+        cwd,
+        tracking_slot.clone(),
+        tracking_slot,
+        started_at,
+    );
     Ok(pane_id)
 }
 
@@ -818,17 +887,24 @@ fn start_agent(
         .lock()
         .unwrap()
         .set_slot_tab(&project, agent, slot, &tab_id.name)?;
+    let tracking_slot = format!("pane-{}", Uuid::new_v4());
     let pane_id = spawn_pane(
         daemon,
         cwd.clone(),
         adapter.executable(),
         &[],
-        Some(slot),
-        Some(slot.to_owned()),
+        Some((agent, slot)),
+        Some(tracking_slot.clone()),
         tab_id,
     )?;
     if adapter.id() == "codex" {
-        watch_codex_session(Arc::clone(daemon), cwd, slot.to_owned(), started_at);
+        watch_codex_session(
+            Arc::clone(daemon),
+            cwd,
+            slot.to_owned(),
+            tracking_slot,
+            started_at,
+        );
     }
     Ok(pane_id)
 }
@@ -859,15 +935,28 @@ fn resume_agent(
         .set_slot_tab(&project, agent, slot, &tab_id.name)?;
     let arguments = adapter.resume_arguments(&session_id);
     let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let tracking_slot = format!("pane-{}", Uuid::new_v4());
     spawn_pane(
         daemon,
         cwd,
         adapter.executable(),
         &argument_refs,
-        Some(slot),
-        Some(slot.to_owned()),
+        Some((agent, slot)),
+        Some(tracking_slot),
         tab_id,
     )
+}
+
+fn logical_slot_for_report(
+    tracked: &[(String, String)],
+    agent: &str,
+    reported_slot: &str,
+) -> String {
+    tracked
+        .iter()
+        .find(|(tracked_agent, _)| tracked_agent == agent)
+        .map(|(_, slot)| slot.clone())
+        .unwrap_or_else(|| reported_slot.to_owned())
 }
 
 fn tab_for(
@@ -889,7 +978,13 @@ fn agent_adapter(agent: &str) -> Result<&'static dyn agents::AgentAdapter> {
     })
 }
 
-fn watch_codex_session(daemon: Arc<Daemon>, cwd: PathBuf, slot: String, started_at: SystemTime) {
+fn watch_codex_session(
+    daemon: Arc<Daemon>,
+    cwd: PathBuf,
+    slot: String,
+    tracking_slot: String,
+    started_at: SystemTime,
+) {
     thread::spawn(move || {
         let codex_home = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
@@ -912,7 +1007,7 @@ fn watch_codex_session(daemon: Arc<Daemon>, cwd: PathBuf, slot: String, started_
                         &session_id,
                     )?;
                     for pane in daemon.panes.lock().unwrap().values() {
-                        if pane.tracking_slot.as_deref() == Some(slot.as_str()) {
+                        if pane.tracking_slot.as_deref() == Some(tracking_slot.as_str()) {
                             let mut tracked = pane.agent_slots.lock().unwrap();
                             if !tracked
                                 .iter()
@@ -1013,11 +1108,23 @@ fn spawn_pane(
     cwd: PathBuf,
     executable: &str,
     arguments: &[&str],
-    agent_slot: Option<&str>,
+    agent_identity: Option<(&str, &str)>,
     tracking_slot: Option<String>,
     tab: workspace_core::WorkspaceTab,
 ) -> Result<String> {
     let project = daemon.database.lock().unwrap().ensure_project(&cwd)?;
+    let reservation = agent_identity
+        .map(|(agent, slot)| {
+            AgentSlotReservation::acquire(
+                daemon,
+                AgentSlotKey {
+                    project_id: project.id,
+                    agent: agent.to_owned(),
+                    slot: slot.to_owned(),
+                },
+            )
+        })
+        .transpose()?;
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 40,
@@ -1034,7 +1141,10 @@ fn spawn_pane(
     // This prevents a separate, ordinary `codex`/`claude` invocation from
     // colliding with a managed pane's default slot.
     command.env("BASTION_MANAGED_PANE", "1");
-    if let Some(slot) = tracking_slot.as_deref().or(agent_slot) {
+    if let Some(slot) = tracking_slot
+        .as_deref()
+        .or_else(|| agent_identity.map(|(_, slot)| slot))
+    {
         command.env("WORKSPACE_AGENT_SLOT", slot);
     }
     let child = pair.slave.spawn_command(command)?;
@@ -1042,6 +1152,13 @@ fn spawn_pane(
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
     let label = next_pane_label(daemon, &project);
+    daemon.database.lock().unwrap().record_pane(
+        &pane_id,
+        project.id,
+        tab.id,
+        &label,
+        &format!("{executable} {}", arguments.join(" ")),
+    )?;
     let pane = Arc::new(Pane {
         project: project.clone(),
         writer: Mutex::new(writer),
@@ -1054,21 +1171,15 @@ fn spawn_pane(
         command: format!("{executable} {}", arguments.join(" ")),
         label: Mutex::new(label.clone()),
         agent_slots: Mutex::new(
-            agent_slot
-                .map(|slot| vec![(executable.to_owned(), slot.to_owned())])
+            agent_identity
+                .map(|(agent, slot)| vec![(agent.to_owned(), slot.to_owned())])
                 .unwrap_or_default(),
         ),
         tracking_slot,
         tab: Mutex::new(tab.name.clone()),
         agent_state: Mutex::new(AgentState::Unknown),
+        agent_slot_key: reservation.map(AgentSlotReservation::commit),
     });
-    daemon.database.lock().unwrap().record_pane(
-        &pane_id,
-        project.id,
-        tab.id,
-        &label,
-        &format!("{executable} {}", arguments.join(" ")),
-    )?;
     daemon
         .panes
         .lock()
@@ -1085,12 +1196,19 @@ fn spawn_pane(
 /// the next pane instead of leaving surprising gaps.
 fn next_pane_label(daemon: &Arc<Daemon>, project: &workspace_core::Project) -> String {
     let panes = daemon.panes.lock().unwrap();
+    let labels = panes
+        .values()
+        .filter(|pane| pane.project.id == project.id)
+        .map(|pane| pane.label.lock().unwrap().clone())
+        .collect::<Vec<_>>();
+    lowest_available_pane_label(labels.iter().map(String::as_str))
+}
+
+fn lowest_available_pane_label<'a>(labels: impl Iterator<Item = &'a str>) -> String {
+    let labels = labels.collect::<std::collections::HashSet<_>>();
     for number in 1_u64.. {
         let candidate = format!("Pane {number}");
-        let taken = panes
-            .values()
-            .any(|pane| pane.project.id == project.id && *pane.label.lock().unwrap() == candidate);
-        if !taken {
+        if !labels.contains(candidate.as_str()) {
             return candidate;
         }
     }
@@ -1156,6 +1274,9 @@ fn pump_pty(
     // keep producing a misleading "saved" workspace on every restart.
     let _ = forget_pane_agent_slots(&daemon, &pane);
     daemon.panes.lock().unwrap().remove(&pane_id);
+    if let Some(key) = &pane.agent_slot_key {
+        daemon.agent_slot_claims.lock().unwrap().remove(key);
+    }
     let mut recent = daemon.recent.lock().unwrap();
     recent.push_front(RecentPane {
         pane_id,
@@ -1204,10 +1325,11 @@ fn pane_resume_command(daemon: &Daemon, pane: &Pane) -> Option<String> {
             .unwrap()
             .slot(&pane.project, &agent, &slot)
             .ok()??;
-        if stored.restore_enabled && stored.last_state != "stopped" {
-            if let Some(session_id) = stored.native_session_id {
-                return Some(adapter.resume_command(&session_id));
-            }
+        if stored.restore_enabled
+            && stored.last_state != "stopped"
+            && let Some(session_id) = stored.native_session_id
+        {
+            return Some(adapter.resume_command(&session_id));
         }
     }
     None
@@ -1393,4 +1515,35 @@ fn write_response(stream: &mut UnixStream, response: Response) -> Result<()> {
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{logical_slot_for_report, lowest_available_pane_label};
+
+    #[test]
+    fn pane_numbering_uses_the_lowest_available_number() {
+        assert_eq!(
+            lowest_available_pane_label(["Pane 1", "Pane 3"].into_iter()),
+            "Pane 2"
+        );
+        assert_eq!(
+            lowest_available_pane_label(["Pane 2", "custom name"].into_iter()),
+            "Pane 1"
+        );
+        assert_eq!(lowest_available_pane_label([].into_iter()), "Pane 1");
+    }
+
+    #[test]
+    fn unique_hook_tokens_map_back_to_stable_agent_slots() {
+        let tracked = vec![("claude".to_owned(), "primary".to_owned())];
+        assert_eq!(
+            logical_slot_for_report(&tracked, "claude", "pane-unique-token"),
+            "primary"
+        );
+        assert_eq!(
+            logical_slot_for_report(&tracked, "codex", "pane-unique-token"),
+            "pane-unique-token"
+        );
+    }
 }

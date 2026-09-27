@@ -1,7 +1,16 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, backup::Backup, params};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+const SCHEMA_VERSION: i64 = 1;
+const DATABASE_NAME: &str = "workspace.db";
+const LAST_GOOD_BACKUP: &str = "workspace.db.last-good.bak";
+const PRE_MIGRATION_BACKUP: &str = "workspace.db.pre-migration.bak";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -102,9 +111,34 @@ pub struct StateDb {
 
 impl StateDb {
     pub fn open(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)
+        fs::create_dir_all(state_dir)
             .with_context(|| format!("create state directory {}", state_dir.display()))?;
-        let connection = Connection::open(state_dir.join("workspace.db"))?;
+        let database_path = state_dir.join(DATABASE_NAME);
+        let connection = open_with_recovery(state_dir, &database_path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        let version = schema_version(&connection)?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "Bastion state schema {version} is newer than this binary supports ({SCHEMA_VERSION}); update Bastion instead of opening this database with an older release"
+            );
+        }
+        let has_existing_schema = table_exists(&connection, "projects")?;
+        let migration_needed = has_existing_schema
+            && (version < SCHEMA_VERSION
+                || !column_exists(&connection, "panes", "tab_id")?
+                || !column_exists(&connection, "panes", "label")?
+                || !column_exists(&connection, "agent_slots", "restore_enabled")?
+                || !column_exists(&connection, "agent_slots", "last_tab")?
+                || has_restricted_agent_schema(&connection)?
+                || migration_artifacts_exist(&connection)?);
+        if migration_needed {
+            create_database_backup(&connection, &state_dir.join(PRE_MIGRATION_BACKUP))
+                .context("create pre-migration database backup")?;
+            cleanup_migration_artifacts(&connection)?;
+        }
+
         connection.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -179,6 +213,11 @@ impl StateDb {
             connection.execute_batch("ALTER TABLE agent_slots ADD COLUMN last_tab TEXT;")?;
         }
         migrate_restricted_agent_slots(&connection)?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        repair_restore_invariants(&connection)?;
+        validate_database(&connection)?;
+        create_database_backup(&connection, &state_dir.join(LAST_GOOD_BACKUP))
+            .context("refresh last-good database backup")?;
         Ok(Self { connection })
     }
 
@@ -525,6 +564,18 @@ impl StateDb {
         label: &str,
         command: &str,
     ) -> Result<()> {
+        let tab_belongs_to_project: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspace_tabs WHERE id = ?1 AND project_id = ?2
+            )",
+            params![tab_id, project_id],
+            |row| row.get(0),
+        )?;
+        if !tab_belongs_to_project {
+            anyhow::bail!(
+                "cannot record pane: tab {tab_id} does not belong to workspace {project_id}"
+            );
+        }
         self.connection.execute(
             "INSERT INTO panes (id, project_id, tab_id, label, command_template, pty_state)
              VALUES (?1, ?2, ?3, ?4, ?5, 'running')
@@ -589,18 +640,224 @@ impl StateDb {
         )?;
         Ok(())
     }
+}
 
-    /// `pane-<uuid>` is an internal detection token for a manually started
-    /// shell, not a stable user-selected agent slot. It can observe more than
-    /// one agent over its lifetime, so it must never be an auto-restore target.
-    pub fn quarantine_tracking_slots(&self) -> Result<()> {
-        self.connection.execute(
-            "UPDATE agent_slots SET restore_enabled = 0, updated_at = CURRENT_TIMESTAMP
-             WHERE slot_name LIKE 'pane-%' AND restore_enabled != 0",
-            [],
-        )?;
-        Ok(())
+fn open_with_recovery(state_dir: &Path, database_path: &Path) -> Result<Connection> {
+    if !database_path.exists() && valid_backup(state_dir).is_some() {
+        recover_database(state_dir, database_path)
+            .context("restore missing Bastion state database")?;
     }
+    match Connection::open(database_path) {
+        Ok(connection) => match quick_check(&connection) {
+            Ok(()) => Ok(connection),
+            Err(database_error) => {
+                drop(connection);
+                recover_database(state_dir, database_path).with_context(|| {
+                    format!(
+                        "Bastion state database is damaged ({database_error:#}) and no valid backup could be restored"
+                    )
+                })?;
+                let recovered = Connection::open(database_path).with_context(|| {
+                    format!("open recovered database {}", database_path.display())
+                })?;
+                quick_check(&recovered).context("validate recovered database")?;
+                Ok(recovered)
+            }
+        },
+        Err(database_error) => {
+            recover_database(state_dir, database_path).with_context(|| {
+                format!(
+                    "Bastion state database could not be opened ({database_error}) and no valid backup could be restored"
+                )
+            })?;
+            let recovered = Connection::open(database_path)
+                .with_context(|| format!("open recovered database {}", database_path.display()))?;
+            quick_check(&recovered).context("validate recovered database")?;
+            Ok(recovered)
+        }
+    }
+}
+
+fn recover_database(state_dir: &Path, database_path: &Path) -> Result<()> {
+    let backup =
+        valid_backup(state_dir).context("no valid last-good or pre-migration backup exists")?;
+
+    let recovering = state_dir.join("workspace.db.recovering");
+    if recovering.exists() {
+        fs::remove_file(&recovering)
+            .with_context(|| format!("remove stale recovery file {}", recovering.display()))?;
+    }
+    fs::copy(&backup, &recovering).with_context(|| {
+        format!(
+            "copy recovery backup {} to {}",
+            backup.display(),
+            recovering.display()
+        )
+    })?;
+    let candidate = Connection::open(&recovering)?;
+    quick_check(&candidate).context("validate recovery candidate")?;
+    drop(candidate);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine = state_dir.join(format!(
+        "workspace.db.corrupt-{timestamp}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let preserved_corrupt_database = database_path.exists();
+    if preserved_corrupt_database {
+        fs::rename(database_path, &quarantine)
+            .with_context(|| format!("preserve damaged database as {}", quarantine.display()))?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = state_dir.join(format!("{DATABASE_NAME}{suffix}"));
+        if sidecar.exists() {
+            let quarantined_sidecar = PathBuf::from(format!("{}{suffix}", quarantine.display()));
+            fs::rename(&sidecar, &quarantined_sidecar).with_context(|| {
+                format!(
+                    "preserve damaged database sidecar as {}",
+                    quarantined_sidecar.display()
+                )
+            })?;
+        }
+    }
+    fs::rename(&recovering, database_path)
+        .with_context(|| format!("activate recovered database {}", database_path.display()))?;
+    if preserved_corrupt_database {
+        eprintln!(
+            "recovered Bastion state from {}; damaged database preserved as {}",
+            backup.display(),
+            quarantine.display()
+        );
+    } else {
+        eprintln!(
+            "recovered missing Bastion state database from {}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
+fn valid_backup(state_dir: &Path) -> Option<PathBuf> {
+    [LAST_GOOD_BACKUP, PRE_MIGRATION_BACKUP]
+        .into_iter()
+        .map(|name| state_dir.join(name))
+        .filter(|path| path.metadata().is_ok_and(|metadata| metadata.len() > 0))
+        .find(|path| {
+            Connection::open(path)
+                .and_then(|connection| {
+                    quick_check(&connection).map_err(|_| rusqlite::Error::InvalidQuery)
+                })
+                .is_ok()
+        })
+}
+
+fn create_database_backup(connection: &Connection, destination: &Path) -> Result<()> {
+    let file_name = destination
+        .file_name()
+        .context("database backup path has no filename")?
+        .to_string_lossy();
+    let temporary = destination.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut backup_connection = Connection::open(&temporary)
+            .with_context(|| format!("create database backup {}", temporary.display()))?;
+        {
+            let backup = Backup::new(connection, &mut backup_connection)?;
+            backup.run_to_completion(64, Duration::from_millis(5), None)?;
+        }
+        quick_check(&backup_connection).context("validate database backup")?;
+        drop(backup_connection);
+        fs::File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)
+            .with_context(|| format!("activate database backup {}", destination.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn quick_check(connection: &Connection) -> Result<()> {
+    let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if result.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        anyhow::bail!("SQLite quick_check failed: {result}")
+    }
+}
+
+fn validate_database(connection: &Connection) -> Result<()> {
+    quick_check(connection)?;
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.exists([])? {
+        anyhow::bail!("SQLite foreign_key_check found inconsistent Bastion state")
+    }
+    Ok(())
+}
+
+fn schema_version(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(Into::into)
+}
+
+fn migration_artifacts_exist(connection: &Connection) -> Result<bool> {
+    Ok(table_exists(connection, "agent_slots_migrated")?
+        || table_exists(connection, "panes_migrated")?)
+}
+
+fn cleanup_migration_artifacts(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS panes_migrated;
+         DROP TABLE IF EXISTS agent_slots_migrated;",
+    )?;
+    Ok(())
+}
+
+fn repair_restore_invariants(connection: &Connection) -> Result<()> {
+    // A native conversation belongs to one live restore target. Historical
+    // bugs could save it under multiple workspaces; retain only the newest
+    // record so one daemon restart cannot clone the same agent everywhere.
+    connection.execute(
+        "UPDATE agent_slots AS stale
+            SET restore_enabled = 0, last_state = 'stopped', updated_at = CURRENT_TIMESTAMP
+          WHERE stale.restore_enabled = 1
+            AND stale.native_session_value IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM agent_slots AS winner
+                 WHERE winner.agent_kind = stale.agent_kind
+                   AND winner.native_session_value = stale.native_session_value
+                   AND winner.restore_enabled = 1
+                   AND (
+                       winner.updated_at > stale.updated_at
+                       OR (winner.updated_at = stale.updated_at AND winner.id > stale.id)
+                   )
+            )",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE agent_slots
+            SET restore_enabled = 0, last_state = 'stopped', updated_at = CURRENT_TIMESTAMP
+          WHERE restore_enabled = 1
+            AND (native_session_value IS NULL OR trim(native_session_value) = '')",
+        [],
+    )?;
+    Ok(())
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -619,21 +876,10 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<b
 /// metadata tables that reference it. This is atomic and never touches a
 /// project directory or its files.
 fn migrate_restricted_agent_slots(connection: &Connection) -> Result<()> {
-    let schema: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_slots'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-    let normalized = schema.to_ascii_lowercase();
-    if !normalized.contains("agent_kind in ('claude', 'codex')") {
+    if !has_restricted_agent_schema(connection)? {
         return Ok(());
     }
-
+    cleanup_migration_artifacts(connection)?;
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let result = connection.execute_batch(
         "
@@ -695,6 +941,21 @@ fn migrate_restricted_agent_slots(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn has_restricted_agent_schema(connection: &Connection) -> Result<bool> {
+    let schema: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_slots'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(schema) = schema else {
+        return Ok(false);
+    };
+    let normalized = schema.to_ascii_lowercase();
+    Ok(normalized.contains("agent_kind in ('claude', 'codex')"))
+}
+
 fn project_root(cwd: &Path) -> Result<PathBuf> {
     let canonical = cwd
         .canonicalize()
@@ -739,6 +1000,12 @@ fn git_dir(root: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("bastion-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn older_preferences_enable_update_checks_by_default() {
         let preferences: Preferences =
@@ -773,11 +1040,6 @@ mod tests {
                     .as_deref(),
                 Some("Research")
             );
-            database
-                .record_agent_session(&project, "codex", "pane-test", "session-id")
-                .unwrap();
-            database.quarantine_tracking_slots().unwrap();
-            assert!(database.restorable_slots(&project).unwrap().is_empty());
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -842,6 +1104,197 @@ mod tests {
                 .agent_kind,
             "antigravity"
         );
+        assert!(state_dir.join(PRE_MIGRATION_BACKUP).is_file());
+        assert!(state_dir.join(LAST_GOOD_BACKUP).is_file());
+        assert_eq!(
+            schema_version(&database.connection).unwrap(),
+            SCHEMA_VERSION
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_a_corrupt_database_from_the_last_good_snapshot() {
+        let root = test_root("corruption-recovery");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        {
+            let database = StateDb::open(&state_dir).unwrap();
+            database.ensure_project(&project_root).unwrap();
+        }
+        // A clean reopen refreshes the consistent snapshot with the latest
+        // committed workspace state.
+        drop(StateDb::open(&state_dir).unwrap());
+        fs::write(state_dir.join(DATABASE_NAME), b"not a sqlite database").unwrap();
+
+        let recovered = StateDb::open(&state_dir).unwrap();
+        assert!(recovered.project_at(&project_root).unwrap().is_some());
+        assert!(fs::read_dir(&state_dir).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("workspace.db.corrupt-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_database_without_a_backup_is_preserved_and_reported() {
+        let root = test_root("corruption-no-backup");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let database_path = state_dir.join(DATABASE_NAME);
+        fs::write(&database_path, b"not a sqlite database").unwrap();
+
+        let error = StateDb::open(&state_dir).err().unwrap().to_string();
+        assert!(error.contains("no valid backup"));
+        assert_eq!(fs::read(&database_path).unwrap(), b"not a sqlite database");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_native_sessions_restore_in_only_one_workspace() {
+        let root = test_root("restore-deduplication");
+        let state_dir = root.join("state");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        {
+            let database = StateDb::open(&state_dir).unwrap();
+            let first = database.ensure_project(&first_root).unwrap();
+            let second = database.ensure_project(&second_root).unwrap();
+            database
+                .record_agent_session(&first, "claude", "primary", "same-session")
+                .unwrap();
+            database
+                .record_agent_session(&second, "claude", "primary", "same-session")
+                .unwrap();
+        }
+
+        let database = StateDb::open(&state_dir).unwrap();
+        let first = database.project_at(&first_root).unwrap().unwrap();
+        let second = database.project_at(&second_root).unwrap().unwrap();
+        assert!(database.restorable_slots(&first).unwrap().is_empty());
+        assert_eq!(database.restorable_slots(&second).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forgotten_session_stays_forgotten_after_reopen() {
+        let root = test_root("forgotten-session");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        {
+            let database = StateDb::open(&state_dir).unwrap();
+            let project = database.ensure_project(&project_root).unwrap();
+            database
+                .record_agent_session(&project, "codex", "review", "session-to-delete")
+                .unwrap();
+            database.forget_slot(&project, "codex", "review").unwrap();
+        }
+
+        let database = StateDb::open(&state_dir).unwrap();
+        let project = database.project_at(&project_root).unwrap().unwrap();
+        assert!(database.restorable_slots(&project).unwrap().is_empty());
+        let slot = database.slot(&project, "codex", "review").unwrap().unwrap();
+        assert!(!slot.restore_enabled);
+        assert!(slot.native_session_id.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cannot_reference_another_workspaces_tab() {
+        let root = test_root("pane-workspace-isolation");
+        let state_dir = root.join("state");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let database = StateDb::open(&state_dir).unwrap();
+        let first = database.ensure_project(&first_root).unwrap();
+        let second = database.ensure_project(&second_root).unwrap();
+        let second_tab = database.ensure_tab(&second, "Main").unwrap();
+
+        let error = database
+            .record_pane(
+                "wrong-workspace-pane",
+                first.id,
+                second_tab.id,
+                "Pane 1",
+                "sh -i",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not belong"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_migration_artifacts_are_backed_up_and_cleaned() {
+        let root = test_root("incomplete-migration");
+        let state_dir = root.join("state");
+        drop(StateDb::open(&state_dir).unwrap());
+        let connection = Connection::open(state_dir.join(DATABASE_NAME)).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 0;
+                 CREATE TABLE panes_migrated (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = StateDb::open(&state_dir).unwrap();
+        assert!(!table_exists(&database.connection, "panes_migrated").unwrap());
+        assert_eq!(
+            schema_version(&database.connection).unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(state_dir.join(PRE_MIGRATION_BACKUP).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_main_database_is_restored_from_last_good_backup() {
+        let root = test_root("missing-main-recovery");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        {
+            let database = StateDb::open(&state_dir).unwrap();
+            database.ensure_project(&project_root).unwrap();
+        }
+        drop(StateDb::open(&state_dir).unwrap());
+        fs::remove_file(state_dir.join(DATABASE_NAME)).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = state_dir.join(format!("{DATABASE_NAME}{suffix}"));
+            if sidecar.exists() {
+                fs::remove_file(sidecar).unwrap();
+            }
+        }
+
+        let recovered = StateDb::open(&state_dir).unwrap();
+        assert!(recovered.project_at(&project_root).unwrap().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_downgrade_a_newer_database_schema() {
+        let root = test_root("future-schema");
+        let state_dir = root.join("state");
+        drop(StateDb::open(&state_dir).unwrap());
+        let connection = Connection::open(state_dir.join(DATABASE_NAME)).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        let error = StateDb::open(&state_dir).err().unwrap().to_string();
+        assert!(error.contains("newer than this binary supports"));
+        let connection = Connection::open(state_dir.join(DATABASE_NAME)).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION + 1);
+        fs::remove_dir_all(root).unwrap();
     }
 }

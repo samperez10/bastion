@@ -6,6 +6,7 @@ Bastion is a Termux-native workspace and session manager for terminal-based AI c
 
 - **Persistent panes** — shells and agents continue running in a local background daemon after the interface detaches.
 - **Native session resume and lifecycle state** — project-scoped adapters preserve supported Claude, Codex, and Antigravity sessions and report working, attention, and completion states when the agent exposes the required hooks.
+- **Crash-safe local state** — versioned SQLite migrations create consistent backups, repair duplicate restore targets, and recover from a missing or damaged database when a valid snapshot exists.
 - **Agent awareness** — Claude, Codex, and Antigravity lifecycle hooks distinguish working, completed, and permission-waiting states.
 - **Mobile terminal controls** — touch navigation, scrollback, bracketed paste, terminal mouse forwarding, themes, and pane management work inside one full-screen TUI.
 - **Local by design** — state stays in Termux and daemon communication uses a local Unix socket.
