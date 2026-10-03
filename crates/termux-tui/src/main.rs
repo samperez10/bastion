@@ -1539,6 +1539,7 @@ enum EmbeddedPaneExit {
 struct PaneInputModes {
     application_cursor_keys: bool,
     bracketed_paste: bool,
+    force_bracketed_paste: bool,
 }
 
 enum PaneInputEvent {
@@ -1728,7 +1729,8 @@ fn start_pane_input_pump(
                     if chrome_active.load(Ordering::Acquire) {
                         Some(PaneInputEvent::Paste(text))
                     } else {
-                        let bracketed = modes.lock().unwrap().bracketed_paste;
+                        let modes = *modes.lock().unwrap();
+                        let bracketed = modes.bracketed_paste || modes.force_bracketed_paste;
                         let bytes = bracketed_paste_bytes(&text, bracketed);
                         if writer.lock().unwrap().write_all(&bytes).is_err() {
                             Some(PaneInputEvent::Offline)
@@ -2177,7 +2179,10 @@ fn embedded_pane(
     }
 
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let input_modes = Arc::new(Mutex::new(PaneInputModes::default()));
+    let input_modes = Arc::new(Mutex::new(PaneInputModes {
+        force_bracketed_paste: force_bracketed_paste_for_agent(&active.agent),
+        ..PaneInputModes::default()
+    }));
     let chrome_active = Arc::new(AtomicBool::new(false));
     let (_input_pump, input_rx) = start_pane_input_pump(
         Arc::clone(&writer),
@@ -2220,6 +2225,8 @@ fn embedded_pane(
                 .cloned()
             {
                 active = refreshed;
+                input_modes.lock().unwrap().force_bracketed_paste =
+                    force_bracketed_paste_for_agent(&active.agent);
             }
             roster = updated;
             needs_draw = true;
@@ -2228,10 +2235,10 @@ fn embedded_pane(
             match output_rx.try_recv() {
                 Ok(data) => {
                     terminal_grid.process(&data);
-                    *input_modes.lock().unwrap() = PaneInputModes {
-                        application_cursor_keys: terminal_grid.application_cursor_keys(),
-                        bracketed_paste: terminal_grid.bracketed_paste(),
-                    };
+                    let mut modes = input_modes.lock().unwrap();
+                    modes.application_cursor_keys = terminal_grid.application_cursor_keys();
+                    modes.bracketed_paste = terminal_grid.bracketed_paste();
+                    drop(modes);
                     for reply in terminal_grid.take_replies() {
                         let _ = writer.lock().unwrap().write_all(&reply);
                     }
@@ -2688,6 +2695,15 @@ fn bracketed_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
         bytes.extend_from_slice(b"\x1b[201~");
     }
     bytes
+}
+
+/// Antigravity understands bracketed-paste delimiters but does not always
+/// advertise mode 2004 when it runs behind Bastion's nested PTY. Without the
+/// delimiters, paragraph newlines are indistinguishable from Enter and can
+/// submit one prompt per line. Keep this compatibility policy agent-scoped so
+/// shells and other terminal programs continue to control their own mode.
+fn force_bracketed_paste_for_agent(agent: &str) -> bool {
+    matches!(agent, "antigravity" | "agy")
 }
 
 /// Convert an Android touch-scroll gesture into terminal input.  Applications
@@ -4999,6 +5015,20 @@ mod tests {
         assert_eq!(
             key_to_bytes(KeyCode::F(13), KeyModifiers::NONE, false),
             None
+        );
+    }
+
+    #[test]
+    fn antigravity_paste_is_forwarded_as_one_bracketed_block() {
+        assert!(force_bracketed_paste_for_agent("antigravity"));
+        assert!(force_bracketed_paste_for_agent("agy"));
+        assert!(!force_bracketed_paste_for_agent("claude"));
+        assert!(!force_bracketed_paste_for_agent("codex"));
+        assert!(!force_bracketed_paste_for_agent("shell"));
+
+        assert_eq!(
+            bracketed_paste_bytes("first\nsecond", true),
+            b"\x1b[200~first\nsecond\x1b[201~".to_vec()
         );
     }
 
