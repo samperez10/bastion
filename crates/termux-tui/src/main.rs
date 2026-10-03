@@ -1519,6 +1519,7 @@ struct PaneDescriptor {
     pane_id: String,
     label: String,
     agent: String,
+    agent_slot: Option<String>,
     state: String,
     tab: String,
     workspace_root: String,
@@ -2092,14 +2093,22 @@ fn render_offline_pane(frame: &mut ratatui::Frame, area: Rect, active: &PaneDesc
             Line::raw(""),
             Line::raw(format!("{} has stopped.", active.label)),
             Line::raw(""),
-            Line::from(Span::styled(
-                if active.resume_command.is_some() {
-                    "WORKSPACE · saved session can resume"
-                } else {
-                    "WORKSPACE"
-                },
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            )),
+            Line::raw(""),
+            Line::from(if active.resume_command.is_some() {
+                vec![
+                    Span::styled("ENTER RESUME", Style::default().fg(accent())),
+                    Span::raw("   "),
+                    Span::styled("S SHELL", Style::default().fg(accent())),
+                    Span::raw("   "),
+                    Span::styled("ESC WORKSPACE", Style::default().fg(accent())),
+                ]
+            } else {
+                vec![
+                    Span::styled("ENTER SHELL", Style::default().fg(accent())),
+                    Span::raw("      "),
+                    Span::styled("ESC WORKSPACE", Style::default().fg(accent())),
+                ]
+            }),
         ])
         .style(chrome_style())
         .alignment(ratatui::layout::Alignment::Center)
@@ -2115,17 +2124,27 @@ fn render_offline_pane(frame: &mut ratatui::Frame, area: Rect, active: &PaneDesc
 }
 
 fn offline_pane_rect(area: Rect) -> Rect {
-    centered_fixed(44, 7, area)
+    centered_fixed(48, 9, area)
 }
 
-fn offline_pane_action_rect(area: Rect) -> Rect {
+fn offline_pane_action_rects(area: Rect, resumable: bool) -> Vec<Rect> {
     let popup = offline_pane_rect(area);
-    Rect::new(
+    let row = Rect::new(
         popup.x.saturating_add(1),
         popup.bottom().saturating_sub(2),
         popup.width.saturating_sub(2),
         1,
-    )
+    );
+    let count = if resumable { 3 } else { 2 };
+    let mut actions = Vec::with_capacity(count);
+    let mut x = row.x;
+    for index in 0..count {
+        let remaining = row.right().saturating_sub(x);
+        let width = remaining / (count - index) as u16;
+        actions.push(Rect::new(x, row.y, width, 1));
+        x = x.saturating_add(width);
+    }
+    actions
 }
 
 fn embedded_pane(
@@ -2193,7 +2212,7 @@ fn embedded_pane(
         // Keep routing state derived from the authoritative UI state. The
         // touch acknowledgement below makes transitions into this state
         // atomic from the input thread's point of view.
-        chrome_active.store(overlay.is_some(), Ordering::Release);
+        chrome_active.store(overlay.is_some() || offline, Ordering::Release);
         while let Ok(updated) = roster_rx.try_recv() {
             if let Some(refreshed) = updated
                 .iter()
@@ -2308,6 +2327,20 @@ fn embedded_pane(
                 }
             }
             PaneInputEvent::Key(key) => {
+                if offline && overlay.is_none() {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('r') if active.resume_command.is_some() => {
+                            return recover_offline_pane(state_dir, &active, true);
+                        }
+                        KeyCode::Enter | KeyCode::Char('s') => {
+                            return recover_offline_pane(state_dir, &active, false);
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => {
+                            return Ok(EmbeddedPaneExit::Workspace);
+                        }
+                        _ => continue,
+                    }
+                }
                 // Modal chrome is painted over a retained terminal frame.
                 // Invalidate that frame for every modal key so dismissing a
                 // popup (or changing to a differently sized popup) cannot
@@ -2490,13 +2523,27 @@ fn embedded_pane(
             PaneInputEvent::Mouse(mouse)
                 if offline
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && contains(
-                        offline_pane_action_rect(screen_area),
-                        mouse.column,
-                        mouse.row,
-                    ) =>
+                    && offline_pane_action_rects(screen_area, active.resume_command.is_some())
+                        .iter()
+                        .any(|area| contains(*area, mouse.column, mouse.row)) =>
             {
-                return Ok(EmbeddedPaneExit::Workspace);
+                let actions =
+                    offline_pane_action_rects(screen_area, active.resume_command.is_some());
+                let selected = actions
+                    .iter()
+                    .position(|area| contains(*area, mouse.column, mouse.row))
+                    .unwrap_or(actions.len().saturating_sub(1));
+                if active.resume_command.is_some() {
+                    match selected {
+                        0 => return recover_offline_pane(state_dir, &active, true),
+                        1 => return recover_offline_pane(state_dir, &active, false),
+                        _ => return Ok(EmbeddedPaneExit::Workspace),
+                    }
+                } else if selected == 0 {
+                    return recover_offline_pane(state_dir, &active, false);
+                } else {
+                    return Ok(EmbeddedPaneExit::Workspace);
+                }
             }
             PaneInputEvent::Mouse(mouse)
                 if matches!(
@@ -3825,6 +3872,10 @@ fn pane_descriptor(pane: &serde_json::Value) -> Option<PaneDescriptor> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("shell")
             .to_owned(),
+        agent_slot: pane
+            .get("agent_slot")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         state: pane
             .get("agent_state")
             .and_then(serde_json::Value::as_str)
@@ -3892,7 +3943,7 @@ fn pane_semantic_state(pane: &serde_json::Value) -> (&'static str, String, Color
     let health = pane
         .get("health")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("waiting");
+        .unwrap_or("quiet");
     let (marker, label, color) = match (agent, state, health) {
         (None, _, "active") => ("◇", "shell".to_owned(), success()),
         (None, _, _) => ("◇", "shell".to_owned(), muted()),
@@ -3901,7 +3952,7 @@ fn pane_semantic_state(pane: &serde_json::Value) -> (&'static str, String, Color
         (_, "done", _) => ("✓", "done".to_owned(), accent()),
         (_, "idle", _) => ("○", "idle".to_owned(), muted()),
         (_, _, "active") => ("●", "active".to_owned(), success()),
-        _ => ("◌", "waiting".to_owned(), muted()),
+        _ => ("◌", "quiet".to_owned(), muted()),
     };
     (marker, label, color)
 }
@@ -4591,6 +4642,70 @@ fn dashboard_request(state_dir: &Path, request: Request) -> Result<serde_json::V
     request_value(&mut stream, request)
 }
 
+fn workspace_pane_roster(
+    state_dir: &Path,
+    workspace_root: &str,
+    tab: &str,
+) -> Result<Vec<PaneDescriptor>> {
+    let status = dashboard_request(state_dir, Request::Status)?;
+    let mut panes = status
+        .get("pane_details")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|pane| {
+            pane.get("workspace_root")
+                .and_then(serde_json::Value::as_str)
+                == Some(workspace_root)
+                && pane.get("tab").and_then(serde_json::Value::as_str) == Some(tab)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    panes.sort_by_key(pane_order_key);
+    Ok(pane_roster(&panes))
+}
+
+fn recover_offline_pane(
+    state_dir: &Path,
+    pane: &PaneDescriptor,
+    resume: bool,
+) -> Result<EmbeddedPaneExit> {
+    let cwd = PathBuf::from(&pane.workspace_root);
+    let request = if resume {
+        Request::ResumeAgent {
+            agent: pane.agent.clone(),
+            slot: pane
+                .agent_slot
+                .clone()
+                .context("offline pane has no saved agent slot")?,
+            cwd: Some(cwd),
+            tab: Some(pane.tab.clone()),
+        }
+    } else {
+        Request::StartShell {
+            cwd: Some(cwd),
+            tab: Some(pane.tab.clone()),
+        }
+    };
+    let response = dashboard_request(state_dir, request)?;
+    if response.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+        anyhow::bail!(
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pane recovery failed")
+                .to_owned()
+        );
+    }
+    let pane_id = response
+        .get("pane_id")
+        .and_then(serde_json::Value::as_str)
+        .context("pane recovery returned no pane ID")?
+        .to_owned();
+    let roster = workspace_pane_roster(state_dir, &pane.workspace_root, &pane.tab)?;
+    Ok(EmbeddedPaneExit::Focus { pane_id, roster })
+}
+
 struct NotificationListener {
     stop: mpsc::Sender<()>,
     active_pane: Arc<Mutex<Option<String>>>,
@@ -5142,6 +5257,7 @@ mod tests {
             pane_id: id.to_owned(),
             label: label.to_owned(),
             agent: "claude".to_owned(),
+            agent_slot: Some("primary".to_owned()),
             state: "working".to_owned(),
             tab: "Main".to_owned(),
             workspace_root: "/test/my-app".to_owned(),
@@ -5192,10 +5308,15 @@ mod tests {
             "HISTORY · 54 lines up"
         );
 
-        let offline_action = offline_pane_action_rect(Rect::new(0, 0, 48, 30));
         let offline = offline_pane_rect(Rect::new(0, 0, 48, 30));
-        assert!(contains(offline, offline_action.x, offline_action.y));
-        assert_eq!(offline_action.y, offline.bottom() - 2);
+        let resumable = offline_pane_action_rects(Rect::new(0, 0, 48, 30), true);
+        let shell_only = offline_pane_action_rects(Rect::new(0, 0, 48, 30), false);
+        assert_eq!(resumable.len(), 3);
+        assert_eq!(shell_only.len(), 2);
+        for action in resumable.iter().chain(&shell_only) {
+            assert!(contains(offline, action.x, action.y));
+            assert_eq!(action.y, offline.bottom() - 2);
+        }
     }
 
     #[test]

@@ -599,6 +599,23 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn set_slot_state(
+        &self,
+        project: &Project,
+        agent: &str,
+        slot: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.ensure_slot(project, agent, slot)?;
+        self.connection.execute(
+            "UPDATE agent_slots SET last_state = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE project_id = ?2 AND agent_kind = ?3 AND slot_name = ?4
+               AND config_home_hash = 'default'",
+            params![state, project.id, agent, slot],
+        )?;
+        Ok(())
+    }
+
     pub fn record_pane(
         &self,
         pane_id: &str,
@@ -1083,6 +1100,35 @@ mod tests {
                     .as_deref(),
                 Some("Research")
             );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_pty_preserves_resume_until_the_user_forgets_it() {
+        let root = test_root("unexpected-pane-exit");
+        let state_dir = root.join("state");
+        {
+            let database = StateDb::open(&state_dir).unwrap();
+            let project = database.ensure_project(&root).unwrap();
+            let tab = database.ensure_tab(&project, "Main").unwrap();
+            database
+                .record_pane("pane-1", project.id, tab.id, "Pane 1", "claude")
+                .unwrap();
+            database
+                .record_agent_session(&project, "claude", "primary", "session-1")
+                .unwrap();
+            database
+                .set_slot_state(&project, "claude", "primary", "working")
+                .unwrap();
+
+            database.mark_pane_stopped("pane-1").unwrap();
+            let restorable = database.restorable_slots(&project).unwrap();
+            assert_eq!(restorable.len(), 1);
+            assert_eq!(restorable[0].last_state, "working");
+
+            database.forget_slot(&project, "claude", "primary").unwrap();
+            assert!(database.restorable_slots(&project).unwrap().is_empty());
         }
         std::fs::remove_dir_all(root).unwrap();
     }

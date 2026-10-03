@@ -140,6 +140,7 @@ struct PaneSummary {
     command: String,
     label: String,
     agent_kind: Option<String>,
+    agent_slot: Option<String>,
     resume_command: Option<String>,
     health: &'static str,
     idle_seconds: u64,
@@ -340,6 +341,7 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                     command: pane.command.clone(),
                     label: pane.label.lock().unwrap().clone(),
                     agent_kind: pane_agent_kind(pane),
+                    agent_slot: pane_agent_identity(pane).map(|(_, slot)| slot),
                     resume_command: pane_resume_command(&daemon, pane),
                     health: pane_health(pane),
                     idle_seconds: pane.last_output.lock().unwrap().elapsed().as_secs(),
@@ -359,12 +361,14 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
         }
         Request::ListWorkspaces => {
             let live = daemon.panes.lock().unwrap().values().fold(
-                HashMap::<i64, (i64, Option<String>, &'static str)>::new(),
+                HashMap::<i64, (i64, Option<String>, &'static str, AgentState)>::new(),
                 |mut map, pane| {
+                    let pane_state = *pane.agent_state.lock().unwrap();
                     let entry = map.entry(pane.project.id).or_insert((
                         0,
                         pane_agent_kind(pane),
                         pane_health(pane),
+                        pane_state,
                     ));
                     entry.0 += 1;
                     if entry.1.is_none() {
@@ -372,6 +376,10 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                     }
                     if pane_health(pane) == "active" {
                         entry.2 = "active";
+                    }
+                    if agent_state_priority(pane_state) > agent_state_priority(entry.3) {
+                        entry.1 = pane_agent_kind(pane);
+                        entry.3 = pane_state;
                     }
                     map
                 },
@@ -389,8 +397,13 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                         .find(|slot| slot.restore_enabled && slot.last_state != "stopped")
                         .map(|slot| format!("{} saved", slot.agent_kind));
                     let agent_summary = live_state
-                        .map(|(_, agent, health)| {
-                            format!("{} {health}", agent.as_deref().unwrap_or("shell"))
+                        .map(|(_, agent, health, state)| {
+                            let status = if agent.is_some() && *state != AgentState::Unknown {
+                                agent_state_name(*state)
+                            } else {
+                                health
+                            };
+                            format!("{} {status}", agent.as_deref().unwrap_or("shell"))
                         })
                         .or(saved_summary);
                     Ok(WorkspaceSummary {
@@ -539,14 +552,15 @@ fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
                 *current = state;
                 previous
             };
-            let should_notify = previous != state
-                && match state {
-                    AgentState::Attention => previous == AgentState::Working,
-                    AgentState::Done => {
-                        matches!(previous, AgentState::Working | AgentState::Attention)
-                    }
-                    _ => false,
-                };
+            let logical_slot =
+                logical_slot_for_report(&pane.agent_slots.lock().unwrap(), &agent, &slot);
+            daemon.database.lock().unwrap().set_slot_state(
+                &pane.project,
+                &agent,
+                &logical_slot,
+                agent_state_name(state),
+            )?;
+            let should_notify = should_notify_agent_transition(previous, state);
             if should_notify {
                 let sequence = {
                     let mut next = daemon.next_notification_sequence.lock().unwrap();
@@ -777,8 +791,8 @@ fn stop_pane(daemon: &Arc<Daemon>, pane_id: String, stream: &mut UnixStream) -> 
             },
         );
     };
-    forget_pane_agent_slots(daemon, &pane)?;
     pane.child.lock().unwrap().kill()?;
+    forget_pane_agent_slots(daemon, &pane)?;
     write_response(
         stream,
         Response::Deleted {
@@ -1300,10 +1314,10 @@ fn pump_pty(
     let output_bytes = pane.history.lock().unwrap().len();
     let output = history_tail(&pane.history.lock().unwrap());
     let _ = daemon.database.lock().unwrap().mark_pane_stopped(&pane_id);
-    // A process that exits has no pane left to restore.  This also removes a
-    // bad native session ID (for example, one purged by Claude) so it cannot
-    // keep producing a misleading "saved" workspace on every restart.
-    let _ = forget_pane_agent_slots(&daemon, &pane);
+    // Preserve native agent sessions after an unexpected process exit. Only
+    // explicit StopPane and workspace removal forget restore targets. This
+    // lets the attached client offer recovery without resurrecting panes the
+    // user deliberately closed.
     daemon.panes.lock().unwrap().remove(&pane_id);
     if let Some(key) = &pane.agent_slot_key {
         daemon.agent_slot_claims.lock().unwrap().remove(key);
@@ -1325,13 +1339,17 @@ fn pane_health(pane: &Pane) -> &'static str {
     if pane.last_output.lock().unwrap().elapsed() <= Duration::from_secs(8) {
         "active"
     } else {
-        "waiting"
+        "quiet"
     }
 }
 
+fn pane_agent_identity(pane: &Pane) -> Option<(String, String)> {
+    pane.agent_slots.lock().unwrap().first().cloned()
+}
+
 fn pane_agent_kind(pane: &Pane) -> Option<String> {
-    if let Some((agent, _)) = pane.agent_slots.lock().unwrap().first() {
-        return Some(agent.clone());
+    if let Some((agent, _)) = pane_agent_identity(pane) {
+        return Some(agent);
     }
     let executable = pane
         .command
@@ -1342,6 +1360,37 @@ fn pane_agent_kind(pane: &Pane) -> Option<String> {
     executable.or_else(|| {
         agents::detect_screen(&pane.screen.lock().unwrap().snapshot().output).map(str::to_owned)
     })
+}
+
+fn agent_state_name(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::Attention => "attention",
+        AgentState::Done => "done",
+    }
+}
+
+fn agent_state_priority(state: AgentState) -> u8 {
+    match state {
+        AgentState::Attention => 5,
+        AgentState::Working => 4,
+        AgentState::Done => 3,
+        AgentState::Idle => 2,
+        AgentState::Unknown => 1,
+    }
+}
+
+fn should_notify_agent_transition(previous: AgentState, next: AgentState) -> bool {
+    if previous == next {
+        return false;
+    }
+    match next {
+        AgentState::Attention => true,
+        AgentState::Done => matches!(previous, AgentState::Working | AgentState::Attention),
+        _ => false,
+    }
 }
 
 /// A resume command is shown to the user as a preview only. The daemon still
@@ -1564,8 +1613,38 @@ fn write_response(stream: &mut UnixStream, response: Response) -> Result<()> {
 mod tests {
     use super::{
         configure_terminal_environment, logical_slot_for_report, lowest_available_pane_label,
+        should_notify_agent_transition,
     };
     use portable_pty::CommandBuilder;
+    use workspace_protocol::AgentState;
+
+    #[test]
+    fn lifecycle_notifications_follow_semantic_transitions() {
+        assert!(should_notify_agent_transition(
+            AgentState::Idle,
+            AgentState::Attention
+        ));
+        assert!(should_notify_agent_transition(
+            AgentState::Unknown,
+            AgentState::Attention
+        ));
+        assert!(should_notify_agent_transition(
+            AgentState::Working,
+            AgentState::Done
+        ));
+        assert!(!should_notify_agent_transition(
+            AgentState::Attention,
+            AgentState::Attention
+        ));
+        assert!(!should_notify_agent_transition(
+            AgentState::Idle,
+            AgentState::Done
+        ));
+        assert!(!should_notify_agent_transition(
+            AgentState::Done,
+            AgentState::Idle
+        ));
+    }
 
     #[test]
     fn pane_numbering_uses_the_lowest_available_number() {
