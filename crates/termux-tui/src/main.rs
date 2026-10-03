@@ -2816,6 +2816,13 @@ fn key_to_bytes(
         KeyCode::Char(character) => Some(character.to_string().into_bytes()),
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
+        // Termux may report Shift+Tab either as a distinct BackTab key or as
+        // Tab carrying the SHIFT modifier. Terminal applications expect the
+        // standard reverse-tab sequence in both cases.
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Tab if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+            Some(b"\x1b[Z".to_vec())
+        }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Esc => Some(vec![0x1b]),
         KeyCode::Up => Some(
@@ -4774,8 +4781,25 @@ fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use serde_json::json;
+
+    #[test]
+    fn attached_pane_forwards_plain_and_reverse_tab_distinctly() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Tab, KeyModifiers::NONE, false),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Tab, KeyModifiers::SHIFT, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::BackTab, KeyModifiers::SHIFT, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
 
     fn rendered_masthead(width: u16) -> String {
         let height = workspace_masthead_height(width);
