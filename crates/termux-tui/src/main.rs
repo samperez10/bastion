@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll,
-        read,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind, poll, read,
     },
     execute,
     terminal::{
@@ -2804,77 +2804,112 @@ fn terminal_color(color: &workspace_terminal::CellColor) -> Color {
 
 fn key_to_bytes(
     code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
+    modifiers: KeyModifiers,
     application_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     match code {
-        KeyCode::Char(character) if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-            character
-                .is_ascii_alphabetic()
-                .then(|| vec![(character.to_ascii_lowercase() as u8) - b'a' + 1])
-        }
-        KeyCode::Char(character) => Some(character.to_string().into_bytes()),
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Char(character) => character_key_bytes(character, modifiers),
+        KeyCode::Enter => Some(alt_prefixed(vec![b'\r'], modifiers)),
+        KeyCode::Backspace => Some(alt_prefixed(vec![0x7f], modifiers)),
         // Termux may report Shift+Tab either as a distinct BackTab key or as
         // Tab carrying the SHIFT modifier. Terminal applications expect the
         // standard reverse-tab sequence in both cases.
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Tab if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
-            Some(b"\x1b[Z".to_vec())
-        }
-        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Tab => Some(alt_prefixed(vec![b'\t'], modifiers)),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(
-            if application_cursor_keys {
-                b"\x1bOA"
+        KeyCode::Up => Some(cursor_key_bytes('A', modifiers, application_cursor_keys)),
+        KeyCode::Down => Some(cursor_key_bytes('B', modifiers, application_cursor_keys)),
+        KeyCode::Right => Some(cursor_key_bytes('C', modifiers, application_cursor_keys)),
+        KeyCode::Left => Some(cursor_key_bytes('D', modifiers, application_cursor_keys)),
+        KeyCode::Home => Some(cursor_key_bytes('H', modifiers, application_cursor_keys)),
+        KeyCode::End => Some(cursor_key_bytes('F', modifiers, application_cursor_keys)),
+        KeyCode::PageUp => Some(tilde_key_bytes(5, modifiers)),
+        KeyCode::PageDown => Some(tilde_key_bytes(6, modifiers)),
+        KeyCode::Insert => Some(tilde_key_bytes(2, modifiers)),
+        KeyCode::Delete => Some(tilde_key_bytes(3, modifiers)),
+        KeyCode::F(number) => function_key_bytes(number, modifiers),
+        KeyCode::KeypadBegin => Some(cursor_key_bytes('E', modifiers, false)),
+        KeyCode::Null => Some(vec![0]),
+        _ => None,
+    }
+}
+
+fn character_key_bytes(character: char, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    let bytes = if modifiers.contains(KeyModifiers::CONTROL) {
+        vec![control_character(character)?]
+    } else {
+        character.to_string().into_bytes()
+    };
+    Some(alt_prefixed(bytes, modifiers))
+}
+
+fn control_character(character: char) -> Option<u8> {
+    match character {
+        ' ' | '@' | '`' => Some(0),
+        'a'..='z' | 'A'..='Z' => Some((character.to_ascii_uppercase() as u8) & 0x1f),
+        '[' | '{' => Some(0x1b),
+        '\\' | '|' => Some(0x1c),
+        ']' | '}' => Some(0x1d),
+        '^' | '~' => Some(0x1e),
+        '_' | '/' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+fn alt_prefixed(mut bytes: Vec<u8>, modifiers: KeyModifiers) -> Vec<u8> {
+    if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+    }
+    bytes
+}
+
+fn xterm_modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
+    let parameter = 1
+        + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL));
+    (parameter > 1).then_some(parameter)
+}
+
+fn cursor_key_bytes(
+    final_byte: char,
+    modifiers: KeyModifiers,
+    application_cursor_keys: bool,
+) -> Vec<u8> {
+    if let Some(parameter) = xterm_modifier_parameter(modifiers) {
+        format!("\x1b[1;{parameter}{final_byte}").into_bytes()
+    } else if application_cursor_keys {
+        format!("\x1bO{final_byte}").into_bytes()
+    } else {
+        format!("\x1b[{final_byte}").into_bytes()
+    }
+}
+
+fn tilde_key_bytes(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    if let Some(parameter) = xterm_modifier_parameter(modifiers) {
+        format!("\x1b[{code};{parameter}~").into_bytes()
+    } else {
+        format!("\x1b[{code}~").into_bytes()
+    }
+}
+
+fn function_key_bytes(number: u8, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    let parameter = xterm_modifier_parameter(modifiers);
+    match number {
+        1..=4 => {
+            let final_byte = char::from(b'P' + number - 1);
+            Some(if let Some(parameter) = parameter {
+                format!("\x1b[1;{parameter}{final_byte}").into_bytes()
             } else {
-                b"\x1b[A"
-            }
-            .to_vec(),
-        ),
-        KeyCode::Down => Some(
-            if application_cursor_keys {
-                b"\x1bOB"
-            } else {
-                b"\x1b[B"
-            }
-            .to_vec(),
-        ),
-        KeyCode::Right => Some(
-            if application_cursor_keys {
-                b"\x1bOC"
-            } else {
-                b"\x1b[C"
-            }
-            .to_vec(),
-        ),
-        KeyCode::Left => Some(
-            if application_cursor_keys {
-                b"\x1bOD"
-            } else {
-                b"\x1b[D"
-            }
-            .to_vec(),
-        ),
-        KeyCode::Home => Some(
-            if application_cursor_keys {
-                b"\x1bOH"
-            } else {
-                b"\x1b[H"
-            }
-            .to_vec(),
-        ),
-        KeyCode::End => Some(
-            if application_cursor_keys {
-                b"\x1bOF"
-            } else {
-                b"\x1b[F"
-            }
-            .to_vec(),
-        ),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+                format!("\x1bO{final_byte}").into_bytes()
+            })
+        }
+        5..=12 => {
+            let code = [15_u8, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
+            Some(tilde_key_bytes(code, modifiers))
+        }
         _ => None,
     }
 }
@@ -4781,7 +4816,6 @@ fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use serde_json::json;
 
@@ -4798,6 +4832,58 @@ mod tests {
         assert_eq!(
             key_to_bytes(KeyCode::BackTab, KeyModifiers::SHIFT, false),
             Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn attached_pane_encodes_mobile_and_external_keyboard_modifiers() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('a'), KeyModifiers::CONTROL, false),
+            Some(vec![0x01])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('x'), KeyModifiers::ALT, false),
+            Some(b"\x1bx".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(
+                KeyCode::Left,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                false,
+            ),
+            Some(b"\x1b[1;6D".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Delete, KeyModifiers::ALT, false),
+            Some(b"\x1b[3;3~".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Home, KeyModifiers::NONE, true),
+            Some(b"\x1bOH".to_vec())
+        );
+    }
+
+    #[test]
+    fn attached_pane_encodes_standard_function_keys() {
+        assert_eq!(
+            key_to_bytes(KeyCode::F(1), KeyModifiers::NONE, false),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::F(4), KeyModifiers::ALT, false),
+            Some(b"\x1b[1;3S".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::F(5), KeyModifiers::NONE, false),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::F(12), KeyModifiers::CONTROL, false),
+            Some(b"\x1b[24;5~".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::F(13), KeyModifiers::NONE, false),
+            None
         );
     }
 
